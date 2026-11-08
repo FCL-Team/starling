@@ -137,13 +137,20 @@ pub fn chosen_present_mode(
     vsync: bool,
     setting: Option<PresentMode>,
 ) -> Option<PresentMode> {
-    // A Mailbox present can block for seconds in Android's GLES/Vulkan
-    // drivers (seen on Mali) and ANR the activity during loading. The
-    // Android surface stays on vsync; desktop keeps the setting.
+    // VSync on stays Fifo. VSync off unlocks the frame rate: the present-mode
+    // setting applies, defaulting to Immediate. Mailbox is never picked
+    // implicitly — a mailbox present can block for seconds in some Android
+    // drivers (seen on Mali) and ANR the activity during loading.
     if cfg!(target_os = "android") {
-        return [PresentMode::Fifo, PresentMode::Immediate]
-            .into_iter()
-            .find(|mode| supported.contains(mode));
+        let mut wanted = Vec::new();
+        if !vsync {
+            if let Some(mode) = setting {
+                wanted.push(mode);
+            }
+            wanted.push(PresentMode::Immediate);
+        }
+        wanted.push(PresentMode::Fifo);
+        return wanted.into_iter().find(|mode| supported.contains(mode));
     }
     setting
         .filter(|m| !vsync && supported.contains(m))
