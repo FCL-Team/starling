@@ -20831,6 +20831,9 @@ impl Loading {
         self.draw_menu(&mut batch);
         horizon_client::widgets::publish_frame();
         self.menu.frame_drawn((batch.width, batch.height));
+        horizon_client::gfx::set_android_ime_field_bottom(
+            self.menu.host_ime_field_bottom(&batch),
+        );
         let mut frame = loading_frame(&batch);
         frame.yaw = self.panorama_rotation.update(
             self.started.elapsed().as_secs_f32(),

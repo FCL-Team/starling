@@ -198,7 +198,19 @@ impl FrameScale {
             winit::platform::android::native_content_rect([output.width(), output.height()]);
         let content_height = rect[3].max(1);
         let inset = ime_bottom_inset_px.min(content_height.saturating_sub(1));
-        let uniform = [inset as f32 / content_height as f32, 0.0, 0.0, 0.0];
+        // Lift just past the keyboard's top edge when the focused field's position
+        // is known: a centered field (a server address) otherwise flies off the top
+        // under a full-keyboard lift. Without a position, lift the whole keyboard
+        // height (bottom-of-screen fields such as chat need exactly that).
+        const FIELD_MARGIN_PX: u32 = 8;
+        let field_bottom = super::android_ime_field_bottom();
+        let lift = if field_bottom == 0 {
+            inset
+        } else {
+            let keyboard_top = content_height.saturating_sub(inset);
+            (field_bottom.saturating_sub(keyboard_top) + FIELD_MARGIN_PX).min(inset)
+        };
+        let uniform = [lift as f32 / content_height as f32, 0.0, 0.0, 0.0];
         queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&uniform));
 
         let view = output.create_view(&wgpu::TextureViewDescriptor {

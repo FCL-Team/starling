@@ -19,6 +19,9 @@ use winit::window::Window;
 static ANDROID_IME_VIEWPORT_BOTTOM_INSET: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 #[cfg(target_os = "android")]
+static ANDROID_IME_FIELD_BOTTOM: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+#[cfg(target_os = "android")]
 static ANDROID_GRAPHICS_INFO: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// The host launcher owns Android IME geometry. The engine only consumes the final
@@ -28,6 +31,19 @@ static ANDROID_GRAPHICS_INFO: std::sync::Mutex<Option<String>> = std::sync::Mute
 pub fn set_android_ime_viewport_bottom_inset(bottom_inset_px: u32) {
     ANDROID_IME_VIEWPORT_BOTTOM_INSET
         .store(bottom_inset_px, std::sync::atomic::Ordering::Release);
+}
+
+/// The focused text field's bottom edge in content pixels from the top, so the
+/// presentation lifts the frame just enough to keep it above the keyboard. 0
+/// means unknown (no field or not tracked) and falls back to a full-keyboard lift.
+#[cfg(target_os = "android")]
+pub fn set_android_ime_field_bottom(bottom_px: u32) {
+    ANDROID_IME_FIELD_BOTTOM.store(bottom_px, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(target_os = "android")]
+pub(super) fn android_ime_field_bottom() -> u32 {
+    ANDROID_IME_FIELD_BOTTOM.load(std::sync::atomic::Ordering::Acquire)
 }
 
 #[cfg(target_os = "android")]
