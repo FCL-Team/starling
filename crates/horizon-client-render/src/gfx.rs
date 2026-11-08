@@ -22,6 +22,8 @@ static ANDROID_IME_VIEWPORT_BOTTOM_INSET: std::sync::atomic::AtomicU32 =
 static ANDROID_IME_FIELD_BOTTOM: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 #[cfg(target_os = "android")]
+static ANDROID_IME_LIFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(target_os = "android")]
 static ANDROID_GRAPHICS_INFO: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// The host launcher owns Android IME geometry. The engine only consumes the final
@@ -44,6 +46,18 @@ pub fn set_android_ime_field_bottom(bottom_px: u32) {
 #[cfg(target_os = "android")]
 pub(super) fn android_ime_field_bottom() -> u32 {
     ANDROID_IME_FIELD_BOTTOM.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// How far the presentation currently lifts the frame, in content pixels. The
+/// host's pointer must ride the same shift to land on what the player sees.
+#[cfg(target_os = "android")]
+pub fn android_ime_lift() -> u32 {
+    ANDROID_IME_LIFT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(target_os = "android")]
+pub(super) fn set_android_ime_lift(px: u32) {
+    ANDROID_IME_LIFT.store(px, std::sync::atomic::Ordering::Release);
 }
 
 #[cfg(target_os = "android")]

@@ -210,6 +210,7 @@ impl FrameScale {
             let keyboard_top = content_height.saturating_sub(inset);
             (field_bottom.saturating_sub(keyboard_top) + FIELD_MARGIN_PX).min(inset)
         };
+        super::set_android_ime_lift(lift);
         let uniform = [lift as f32 / content_height as f32, 0.0, 0.0, 0.0];
         queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&uniform));
 

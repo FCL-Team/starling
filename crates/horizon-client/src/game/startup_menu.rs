@@ -270,20 +270,6 @@ impl StartupMenu {
         }
     }
 
-    /// The focused field's bottom edge in content pixels from the top, for the
-    /// host's IME lift (the presentation keeps the field above the keyboard).
-    /// 0 when nothing is focused or host controls are off.
-    pub(super) fn host_ime_field_bottom(&self, batch: &HudBatch) -> u32 {
-        if !crate::host_handoff::get().host_controls {
-            return 0;
-        }
-        self.title
-            .as_ref()
-            .and_then(|t| t.focused_rect((batch.width, batch.height)))
-            .map(|[_, y, _, h]| ((y + h) * batch.scale).round().max(0.0) as u32)
-            .unwrap_or(0)
-    }
-
     /// Which screen is open, as far as the keyboard's focus cares.
     fn key_screen(&self) -> u64 {
         use std::hash::{Hash, Hasher};
@@ -602,14 +588,20 @@ impl Loading {
 
     /// A left press just landed: tapping a text field asks the host for its
     /// keyboard (the field is focused by this same click, so its current value
-    /// prefills the host's editor for correct diffs).
+    /// prefills the host's editor for correct diffs). The tapped field's bottom
+    /// edge also drives the IME lift so it stays above the keyboard.
     fn host_keyboard_tap(&mut self) {
         if !crate::host_handoff::get().host_controls {
             return;
         }
-        if !crate::platform::field_at([self.menu.cursor.0, self.menu.cursor.1]) {
+        let cursor = self.menu.cursor;
+        let Some([_, y, _, h]) = crate::platform::field_rect_at([cursor.0, cursor.1]) else {
             return;
-        }
+        };
+        let batch = HudBatch::new(self.menu_size());
+        horizon_client::gfx::set_android_ime_field_bottom(
+            ((y + h) * batch.scale).round().max(0.0) as u32,
+        );
         let initial = self
             .menu
             .title

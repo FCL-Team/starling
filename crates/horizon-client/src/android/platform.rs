@@ -612,14 +612,21 @@ pub fn poll() -> Vec<Output> {
     })
 }
 
+/// The text field under the point (GUI coordinates, as the touch menus use),
+/// for the host's IME lift to keep the tapped field above its keyboard.
+pub fn field_rect_at(p: [f32; 2]) -> Option<[f32; 4]> {
+    horizon_client::widgets::last_targets().iter().find_map(|t| {
+        let [x, y, w, h] = t.rect;
+        (t.kind == horizon_client::widgets::Kind::Field
+            && (x..x + w).contains(&p[0])
+            && (y..y + h).contains(&p[1]))
+        .then_some(t.rect)
+    })
+}
+
 /// Field hit tests use the same GUI coordinates as the touch menus.
 pub fn field_at(p: [f32; 2]) -> bool {
-    horizon_client::widgets::last_targets().iter().any(|t| {
-        let [x, y, w, h] = t.rect;
-        t.kind == horizon_client::widgets::Kind::Field
-            && (x..x + w).contains(&p[0])
-            && (y..y + h).contains(&p[1])
-    })
+    field_rect_at(p).is_some()
 }
 
 /// Only Microsoft's device-code verification pages can be opened by the login panel.

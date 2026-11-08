@@ -1148,12 +1148,21 @@ impl Game<'_> {
         Ok(false)
     }
     pub(super) fn android_show_keyboard(&mut self) {
-        // The host launcher owns the IME for embedded Horizon: never open Horizon's
-        // on-screen/system keyboard from T, /, a focused field, controller settings, or
-        // Horizon's own Keyboard action. The host polls text-field focus every frame
-        // (`Game::sync_ime` / `StartupMenu::frame_drawn`) and shows its keyboard from
-        // that, which also covers mouse-click focus this touch-only path never sees.
+        // The host launcher owns the IME for embedded Horizon. This is an explicit
+        // typing intent (T, /, the sign editor, dialogs, the keyboard button), so
+        // ask it for the keyboard: the frame lifts fully (chat sits at the bottom;
+        // centered editors stay visible above the keyboard). Focus alone never
+        // opens it — that is the tap handler's job (native IME interaction).
         if crate::host_handoff::get().host_controls {
+            let initial = if self.dialog_open() {
+                self.dialog_edit_value()
+            } else if self.screen == Screen::BlockEditor {
+                self.block_editor_edit_value().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            horizon_client::gfx::set_android_ime_field_bottom(u32::MAX - 16);
+            crate::platform::request_host_keyboard(&initial);
             return;
         }
         // The standalone in-world keyboard button needs a real editor to receive text.

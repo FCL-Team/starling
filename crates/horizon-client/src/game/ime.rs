@@ -7,7 +7,6 @@ use horizon_client::{
     hud::HudBatch,
     preedit::{self, PreeditEvent},
 };
-use winit::keyboard::KeyCode;
 
 impl Game<'_> {
     /// Whether a text box has focus right now (the fields `ime_commit` can fill).
@@ -37,34 +36,38 @@ impl Game<'_> {
         }
     }
 
-    /// The focused text field's current value to prefill the host's keyboard
-    /// with, so editing an existing value sends correct diffs.
-    fn host_keyboard_initial(&mut self) -> String {
-        if self.dialog_open() {
-            return self.dialog_edit_value();
+    /// A left press just landed on the game's screens: tapping a text field
+    /// (an inventory search box) asks the host for its keyboard, native-IME
+    /// style. The tapped field's bottom edge drives the IME lift so the field
+    /// stays above the keyboard.
+    pub(super) fn host_keyboard_tap(&mut self) {
+        if !crate::host_handoff::get().host_controls {
+            return;
         }
-        if let Some(title) = self.title.as_mut() {
-            title.field_key(KeyCode::End, false, false);
-            if let Some((_, value, _)) = title.focused_field() {
-                return value.clone();
-            }
+        let cursor = self.cursor;
+        let Some([_, y, _, h]) = crate::platform::field_rect_at([cursor.0, cursor.1]) else {
+            return;
+        };
+        if let Some(b) = self.gui_scale() {
+            horizon_client::gfx::set_android_ime_field_bottom(
+                ((y + h) * b.scale).round().max(0.0) as u32,
+            );
         }
-        String::new()
+        crate::platform::request_host_keyboard("");
     }
 
     /// Allow the input method only while a text box has focus.
     pub(super) fn sync_ime(&mut self) {
-        // Host-controls launches: the launcher owns the IME and Horizon never
-        // has its own editor, so its keyboard follows text-field focus changes
-        // here (mouse clicks and Tab navigation focus fields without a touch).
+        // Host-controls launches: the launcher owns the IME. Losing text-field
+        // focus closes the host's keyboard here; showing it is the tap handler's
+        // (`host_keyboard_tap`) and the explicit typing intents' job
+        // (`android_show_keyboard`) — a focused field alone never pops it up,
+        // matching Android's own IME interaction.
         if crate::host_handoff::get().host_controls {
             let want = self.text_field_focused();
             if want != self.host_keyboard {
                 self.host_keyboard = want;
-                if want {
-                    let initial = self.host_keyboard_initial();
-                    crate::platform::request_host_keyboard(&initial);
-                } else {
+                if !want {
                     crate::platform::hide_host_keyboard();
                 }
             }
