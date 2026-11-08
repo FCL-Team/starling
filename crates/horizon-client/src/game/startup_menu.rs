@@ -249,9 +249,10 @@ impl StartupMenu {
         self.sync_host_keyboard();
     }
 
-    /// Host-controls launches: the launcher owns the IME, so its keyboard
-    /// follows text-field focus changes here (mouse clicks, Tab navigation and
-    /// touch taps all focus fields without Horizon's own editor ever existing).
+    /// Host-controls launches: the launcher owns the IME. Losing text-field
+    /// focus closes the host's keyboard here; showing it is the click handler's
+    /// job (`menu_event`) so keyboard navigation and default focus never pop it
+    /// up — only a real tap does, matching Android's own IME interaction.
     fn sync_host_keyboard(&mut self) {
         if !crate::host_handoff::get().host_controls {
             return;
@@ -264,17 +265,7 @@ impl StartupMenu {
             return;
         }
         self.host_keyboard = focused;
-        if focused {
-            let initial = self
-                .title
-                .as_mut()
-                .and_then(|t| {
-                    t.field_key(winit::keyboard::KeyCode::End, false, false);
-                    t.focused_field().map(|(_, s, _)| s.to_owned())
-                })
-                .unwrap_or_default();
-            crate::platform::request_host_keyboard(&initial);
-        } else {
+        if !focused {
             crate::platform::hide_host_keyboard();
         }
     }
@@ -607,6 +598,25 @@ impl Loading {
         self.renderer
             .as_ref()
             .map_or([1280, 720], |r| [r.config.width, r.config.height])
+    }
+
+    /// A left press just landed: tapping a text field asks the host for its
+    /// keyboard (the field is focused by this same click, so its current value
+    /// prefills the host's editor for correct diffs).
+    fn host_keyboard_tap(&mut self) {
+        if !crate::host_handoff::get().host_controls {
+            return;
+        }
+        if !crate::platform::field_at([self.menu.cursor.0, self.menu.cursor.1]) {
+            return;
+        }
+        let initial = self
+            .menu
+            .title
+            .as_mut()
+            .and_then(|t| t.focused_field().map(|(_, s, _)| s.to_owned()))
+            .unwrap_or_default();
+        crate::platform::request_host_keyboard(&initial);
     }
 
     fn ui_scale(&self) -> (f32, f32, f32) {
@@ -2348,6 +2358,7 @@ impl Loading {
                             (batch.width, batch.height),
                         );
                         self.menu_action(event_loop, action);
+                        self.host_keyboard_tap();
                     }
                 }
             }
