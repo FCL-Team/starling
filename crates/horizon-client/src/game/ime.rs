@@ -7,6 +7,7 @@ use horizon_client::{
     hud::HudBatch,
     preedit::{self, PreeditEvent},
 };
+use winit::keyboard::KeyCode;
 
 impl Game<'_> {
     /// Whether a text box has focus right now (the fields `ime_commit` can fill).
@@ -36,8 +37,39 @@ impl Game<'_> {
         }
     }
 
+    /// The focused text field's current value to prefill the host's keyboard
+    /// with, so editing an existing value sends correct diffs.
+    fn host_keyboard_initial(&mut self) -> String {
+        if self.dialog_open() {
+            return self.dialog_edit_value();
+        }
+        if let Some(title) = self.title.as_mut() {
+            title.field_key(KeyCode::End, false, false);
+            if let Some((_, value, _)) = title.focused_field() {
+                return value.clone();
+            }
+        }
+        String::new()
+    }
+
     /// Allow the input method only while a text box has focus.
     pub(super) fn sync_ime(&mut self) {
+        // Host-controls launches: the launcher owns the IME and Horizon never
+        // has its own editor, so its keyboard follows text-field focus changes
+        // here (mouse clicks and Tab navigation focus fields without a touch).
+        if crate::host_handoff::get().host_controls {
+            let want = self.text_field_focused();
+            if want != self.host_keyboard {
+                self.host_keyboard = want;
+                if want {
+                    let initial = self.host_keyboard_initial();
+                    crate::platform::request_host_keyboard(&initial);
+                } else {
+                    crate::platform::hide_host_keyboard();
+                }
+            }
+            return;
+        }
         // Android's focused Rust/JNI editor owns showing/hiding the keyboard.
         // NativeActivity's separate winit IME calls must not steal that focus.
         #[cfg(target_os = "android")]

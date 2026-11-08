@@ -2,7 +2,7 @@ use crate::monitor::{MonitorHandle as RootMonitorHandle, VideoModeHandle as Root
 use crate::window::Fullscreen as RootFullscreen;
 
 #[cfg(android_platform)]
-mod android;
+pub(crate) mod android;
 #[cfg(ios_platform)]
 mod ios;
 #[cfg(any(x11_platform, wayland_platform))]

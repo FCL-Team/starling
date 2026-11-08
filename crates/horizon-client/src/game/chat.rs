@@ -1114,6 +1114,13 @@ impl Game<'_> {
     /// so calling this every frame while chat is open keeps the value fresh.
     #[cfg(target_os = "android")]
     fn visible_chat_height(batch: &HudBatch) -> f32 {
+        // FCL owns the keyboard: it lifts the whole finished frame by the keyboard's
+        // height (gfx::set_android_ime_viewport_bottom_inset), so the chat stays at
+        // the bottom of the frame and lands just above the keyboard. Moving it up
+        // here as well would move it twice, off the top of the screen.
+        if crate::host_handoff::get().host_controls {
+            return batch.height;
+        }
         let Some(bottom) = crate::native_ime::viewport_bottom() else {
             return batch.height;
         };

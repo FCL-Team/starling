@@ -15,6 +15,26 @@ pub(crate) fn cache_dir() -> Option<&'static std::path::Path> {
 }
 static INPUT_MODE: std::sync::Mutex<(InputMode, InputMode)> =
     std::sync::Mutex::new((InputMode::Auto, InputMode::Touch));
+static HOST_INPUT_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
+
+/// Embedded launchers such as FCL own Android touch/controller/keyboard routing. When
+/// enabled, Horizon stays in keyboard/mouse mode and its native controller/keypad
+/// backends cannot steal or duplicate events that the host is already mapping.
+pub fn configure_host_input_exclusive(enabled: bool) {
+    HOST_INPUT_EXCLUSIVE.store(enabled, Ordering::Release);
+    if enabled {
+        {
+            let mut input = INPUT_MODE.lock().unwrap();
+            *input = (InputMode::KeyboardMouse, InputMode::KeyboardMouse);
+        }
+        clear_gamepads();
+        clear_keypad();
+    }
+}
+
+fn host_input_exclusive() -> bool {
+    HOST_INPUT_EXCLUSIVE.load(Ordering::Acquire)
+}
 static GAMEPADS: std::sync::LazyLock<std::sync::Mutex<Devices>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Devices::default()));
 pub fn input_mode() -> InputMode {
@@ -24,6 +44,11 @@ pub fn active_input() -> InputMode {
     INPUT_MODE.lock().unwrap().1
 }
 pub fn configure_input(mode: InputMode) {
+    let mode = if host_input_exclusive() {
+        InputMode::KeyboardMouse
+    } else {
+        mode
+    };
     let mut input = INPUT_MODE.lock().unwrap();
     if input.0 != mode {
         *input = (
@@ -39,6 +64,9 @@ pub fn configure_input(mode: InputMode) {
     }
 }
 pub fn note_input(kind: InputMode) -> bool {
+    if host_input_exclusive() && kind != InputMode::KeyboardMouse {
+        return false;
+    }
     let mut input = INPUT_MODE.lock().unwrap();
     if input.0 != InputMode::Auto && input.0 != kind {
         return false;
@@ -50,6 +78,9 @@ pub fn note_input(kind: InputMode) -> bool {
     true
 }
 pub fn gamepad_event(id: i32, event: &winit::event::DeviceEvent) -> bool {
+    if host_input_exclusive() {
+        return false;
+    }
     use winit::event::{DeviceEvent, ElementState};
     let activity = {
         let mut devices = GAMEPADS.lock().unwrap();
@@ -127,14 +158,14 @@ static KEYPAD: std::sync::LazyLock<std::sync::Mutex<crate::keypad::Keypad>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(crate::keypad::Keypad::default()));
 pub fn configure_keypad_settings(settings: &crate::keypad::Settings) {
     KEYPAD.lock().unwrap().configure(settings);
-    KEYPAD_ENABLED.store(settings.enabled, Ordering::Relaxed);
+    KEYPAD_ENABLED.store(settings.enabled && !host_input_exclusive(), Ordering::Relaxed);
 }
 pub fn configure_keypad(enabled: bool) {
-    KEYPAD_ENABLED.store(enabled, Ordering::Relaxed);
+    KEYPAD_ENABLED.store(enabled && !host_input_exclusive(), Ordering::Relaxed);
     clear_keypad();
 }
 pub fn keypad_enabled() -> bool {
-    KEYPAD_ENABLED.load(Ordering::Relaxed)
+    !host_input_exclusive() && KEYPAD_ENABLED.load(Ordering::Relaxed)
 }
 pub fn keypad_key(key: winit::keyboard::KeyCode, down: bool) -> bool {
     keypad_enabled()
@@ -150,10 +181,14 @@ pub fn clear_keypad() {
         .clear();
 }
 pub fn keypad_state() -> crate::gamepad::PadState {
-    KEYPAD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .poll()
+    if host_input_exclusive() {
+        crate::gamepad::PadState::default()
+    } else {
+        KEYPAD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .poll()
+    }
 }
 static OPEN_GL: AtomicBool = AtomicBool::new(cfg!(target_pointer_width = "32"));
 pub fn configure_graphics(open_gl: bool) {

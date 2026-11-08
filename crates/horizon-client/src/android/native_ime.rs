@@ -564,6 +564,13 @@ impl Ui {
                         let _ = env.exception_clear();
                     }
                 }
+                // Host launchers embed the engine in a full SHORT_EDGES surface shared
+                // with their own controls overlay: both sides address the same
+                // full-frame pixels, so no safe-inset letterbox may shift the pointer
+                // mapping or the viewport.
+                if crate::host_handoff::get().embedded() {
+                    safe = [0; 4];
+                }
                 if safe != [0; 4] {
                     let location = env.new_int_array(2)?;
                     env.call_method(

@@ -260,3 +260,16 @@ pub fn native_pointer_device(id: crate::event::DeviceId) -> bool {
 pub fn native_content_origin() -> [u32; 2] {
     crate::platform_impl::viewport::origin()
 }
+
+/// Input pushed by a host launcher's own Android views while it embeds the engine.
+///
+/// The queue is inert until [`host_input::enable`] is called; the standalone app never
+/// enables it. While enabled, gamepad and pure D-pad events stay unhandled so Android
+/// delivers them to the host activity's views, and the host pushes keyboard, mouse,
+/// scroll and committed text through [`host_input::push`] instead.
+pub mod host_input {
+    pub use crate::platform_impl::android::host_input::{
+        enable, enabled, gamepads_to_host, menu_cursor, push, set_cursor, set_menu_capture,
+        set_pointer_grabbed, set_waker, HostInput, DEVICE_ID,
+    };
+}

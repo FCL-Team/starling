@@ -72,6 +72,8 @@ pub(super) struct Launcher {
     pub(super) diagnostics_modal_open: bool,
     focus: Option<usize>,
     diagnostic_export: Option<mpsc::Receiver<std::result::Result<String, String>>>,
+    /// A host launcher asked to start the game without showing this launcher first.
+    autoplay_pending: bool,
 }
 
 impl Launcher {
@@ -138,13 +140,30 @@ impl Launcher {
             catalog.status = crate::diagnostics::summary(&home);
         }
         horizon_client::android_runtime::graphics_startup::configure(home.clone());
-        if horizon_client::android_runtime::graphics_startup::recover(&home) {
+        let recovered = horizon_client::android_runtime::graphics_startup::recover(&home);
+        if recovered {
             catalog.config.renderer = crate::catalog::RendererMode::VulkanCompatibility;
             if let Err(error) = catalog.config.save(&home) {
                 log::warn!("Could not save graphics recovery choice: {error}");
             }
             catalog.status = "Previous Vulkan startup was interrupted. Using Vulkan compatibility; you can change Rendering mode in Settings.".into();
+        } else if let Some(host) = crate::host_handoff::get().renderer {
+            // The host launcher's choice for this launch (not saved as Horizon's own setting).
+            catalog.config.renderer = match host {
+                crate::host_handoff::HostRenderer::Vulkan => {
+                    crate::catalog::RendererMode::VulkanCompatibility
+                }
+                crate::host_handoff::HostRenderer::VulkanBatching => {
+                    crate::catalog::RendererMode::Vulkan
+                }
+                crate::host_handoff::HostRenderer::OpenGl => crate::catalog::RendererMode::OpenGl,
+            };
         }
+        crate::host_handoff::note_renderer(
+            catalog.config.renderer == crate::catalog::RendererMode::OpenGl,
+            catalog.config.renderer == crate::catalog::RendererMode::Vulkan,
+            recovered,
+        );
         crate::configure_input_mode(catalog.config.input_host);
         crate::device_runtime::configure(catalog.config.device);
         horizon_client::ui_theme::set_ui_scale_percent(catalog.config.ui_scale_percent);
@@ -250,7 +269,13 @@ impl Launcher {
             diagnostics_modal_open: false,
             focus: None,
             diagnostic_export: None,
+            autoplay_pending: crate::host_handoff::get().autoplay,
         }
+    }
+
+    /// The game folder of the next launch: the host's instance when embedded.
+    fn game_home(&self) -> PathBuf {
+        crate::host_handoff::get().game_home(|| self.catalog.config.game_home(&self.home))
     }
 
     fn restore_launcher(&mut self, events: &ActiveEventLoop) {
@@ -272,6 +297,12 @@ impl Launcher {
         self.launching = false;
         self.launch_pending_tick = false;
         horizon_client::discord_presence::stop();
+        if crate::host_handoff::return_to_host() {
+            // The game saved on exit. android_main finishes the activity and the process,
+            // which returns the player to the host launcher.
+            events.exit();
+            return;
+        }
         horizon_client::ui_theme::reset_atlas();
         self.cursor = (0.0, 0.0);
         self.drag = None;
@@ -515,11 +546,7 @@ impl Launcher {
             self.catalog.config.save(&self.home)?;
             self.catalog.config.apply_experimental_to_game(&self.home);
             // Migrate the earlier launcher preset once; subsequent edits belong to Key Binds.
-            let keypad_path = self
-                .catalog
-                .config
-                .game_home(&self.home)
-                .join("horizon-keypad.json");
+            let keypad_path = self.game_home().join("horizon-keypad.json");
             if self.catalog.config.keypad_controls && !keypad_path.exists() {
                 if let Some(dir) = keypad_path.parent() {
                     std::fs::create_dir_all(dir)?;
@@ -531,7 +558,14 @@ impl Launcher {
                 .save(&keypad_path)?;
             }
             self.catalog.config.keypad_controls = false;
-            let game_home = self.catalog.config.game_home(&self.home);
+            let game_home = self.game_home();
+            // The host launcher already verified its Microsoft account and wrote a session.
+            if !self.session_ready
+                && let Some(file) = crate::host_handoff::take_session()
+            {
+                self.prepared_session = Some(file);
+                self.session_ready = true;
+            }
             if !self.session_ready && crate::account::Accounts::load().selected().is_some() {
                 let id = self.catalog.config.microsoft_client_id.clone();
                 let wardrobe_home = self.home.join("wardrobe");
@@ -570,7 +604,7 @@ impl Launcher {
                 self.wardrobe
                     .prepare_game(&self.catalog.config.name, &game_home)?;
             }
-            let extra_arguments = if crate::PUBLIC_BUILD {
+            let mut extra_arguments = if crate::PUBLIC_BUILD {
                 Vec::new()
             } else {
                 match std::fs::read(self.home.join("android-launch.json")) {
@@ -579,6 +613,7 @@ impl Launcher {
                     Err(e) => return Err(e.into()),
                 }
             };
+            extra_arguments.extend(crate::host_handoff::get().quick_play_arguments());
 
             self.audio = None;
             self.error = None;
@@ -607,7 +642,13 @@ impl Launcher {
                     .join(horizon_core::VANILLA_VERSION),
                 game_home,
                 session_file: self.prepared_session.take(),
-                offline_name: crate::catalog::truncate_player_name(&self.catalog.config.name),
+                // The host launcher passes the player's own offline name; a stale
+                // embedded android-launcher.json name must not win.
+                offline_name: crate::host_handoff::get()
+                    .offline_name()
+                    .unwrap_or_else(|| {
+                        crate::catalog::truncate_player_name(&self.catalog.config.name)
+                    }),
                 server: self.catalog.config.server.clone(),
                 control_socket: (!crate::PUBLIC_BUILD).then(|| self.home.join("control.json")),
                 extra_arguments,
@@ -769,6 +810,8 @@ impl ApplicationHandler for Launcher {
                 }
                 Ok(())
             }
+            // A host launcher's autoplay shows its own screens: never flash this launcher.
+            WindowEvent::RedrawRequested if self.autoplay_pending => Ok(()),
             WindowEvent::RedrawRequested => self.draw_pages(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if event.physical_key
@@ -852,6 +895,10 @@ impl ApplicationHandler for Launcher {
         }
         if let Some(result) = self.worker.as_ref().and_then(|w| w.try_recv().ok()) {
             self.worker = None;
+            if result.is_ok() && crate::host_handoff::get().autoplay {
+                // The resources were the only thing missing: carry on into the game.
+                self.autoplay_pending = true;
+            }
             if let Err(error) = result {
                 let message = error.to_string();
                 if message.contains("Dns Failed") || message.contains("lookup address") {
@@ -962,6 +1009,30 @@ impl ApplicationHandler for Launcher {
             }
         }
 
+        // Start once the launcher has a window, like a Play press from the host.
+        if self.autoplay_pending
+            && self.window.is_some()
+            && self.worker.is_none()
+            && self.session_worker.is_none()
+        {
+            self.autoplay_pending = false;
+            let started = self.error.is_none()
+                && match self.action(events) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        self.fail(error);
+                        false
+                    }
+                };
+            if !started {
+                // The host shows android-error.txt; this launcher stays out of sight.
+                events.exit();
+                return;
+            }
+            if self.game.is_some() {
+                return;
+            }
+        }
         if self.launch_pending_tick {
             self.launch_pending_tick = false;
             if let Err(error) = self.action(events) {

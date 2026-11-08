@@ -43,6 +43,18 @@ mod documents;
 mod exit_reports;
 #[path = "android/gallery.rs"]
 mod gallery;
+// Launch handoff when a host launcher (FCL) embeds the engine in its own process.
+#[path = "android/host_handoff.rs"]
+mod host_handoff;
+// Resource installation driven by the host launcher's own progress UI.
+#[path = "android/host_install.rs"]
+mod host_install;
+// The host launcher's own touch controls, virtual mouse and controller mapper.
+#[path = "android/host_input_jni.rs"]
+mod host_input_jni;
+// The host launcher's add-ons screen: package checks in the engine's own process.
+#[path = "android/host_addons_jni.rs"]
+mod host_addons_jni;
 #[path = "android/native_ime.rs"]
 mod native_ime;
 #[path = "android/performance.rs"]
@@ -90,6 +102,12 @@ pub(crate) fn keyboard_mouse_input() -> bool {
     horizon_client::android_runtime::active_input() == catalog::InputHost::KeyboardMouse
 }
 pub(crate) fn configure_input_mode(mode: catalog::InputHost) {
+    // The host's controls arrive as a keyboard and mouse; the engine's touch UI stays hidden.
+    let mode = if host_handoff::get().host_controls {
+        catalog::InputHost::KeyboardMouse
+    } else {
+        mode
+    };
     horizon_client::android_runtime::configure_input(mode);
 }
 pub(crate) fn touch_visible() -> bool {
@@ -103,8 +121,14 @@ pub(crate) fn touch_input(touch: bool) {
     });
 }
 pub(crate) fn save_input_mode() {
+    if host_handoff::get().host_controls {
+        // Forced by the host for this launch only: keep the player's own choice.
+        return;
+    }
     APP.with(|app| {
-        if let Some(home) = app.borrow().as_ref().and_then(|a| a.internal_data_path()) {
+        if let Some(home) = host_handoff::get()
+            .engine_home(app.borrow().as_ref().and_then(|a| a.internal_data_path()))
+        {
             let mut config = catalog::Config::load(&home);
             let mode = horizon_client::android_runtime::input_mode();
             if config.input_host != mode {
@@ -208,7 +232,8 @@ fn android_main(app: AndroidApp) {
         app.enable_motion_axis(axis);
     }
     init_logging();
-    let Some(home) = app.internal_data_path() else {
+    // A host launcher that embeds the engine chooses its home; standalone, it is Android's.
+    let Some(home) = host_handoff::get().engine_home(app.internal_data_path()) else {
         log::error!("Android supplied no application data directory");
         return;
     };
@@ -260,6 +285,15 @@ fn android_main(app: AndroidApp) {
             log::error!("Cannot unpack engine data: {error}");
         }
     }
+    if host_handoff::get().host_controls {
+        // FCL is the only Android input owner for this launch. Native controller and
+        // keypad/touch input modes stay disabled; FCL's mapped controls arrive through
+        // host_input_jni as ordinary keyboard/mouse events.
+        horizon_client::android_runtime::configure_host_input_exclusive(true);
+        winit::platform::android::host_input::enable(true);
+    }
+    // Before any Vulkan instance exists: the launcher's loading screen already makes one.
+    host_handoff::prepare_vulkan_driver();
     let mut launcher = launcher::Launcher::new(home.clone());
     let result = android_event_loop()
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })
@@ -277,5 +311,15 @@ fn android_main(app: AndroidApp) {
     diagnostics::finish();
     platform::finish();
     APP.with(|slot| *slot.borrow_mut() = None);
+    if host_handoff::get().embedded() {
+        // The host's Java views keep Android's HWUI render threads running in this process.
+        // exit() would run C++ static destructors under them, which aborts with "FORTIFY:
+        // pthread_mutex_lock called on a destroyed mutex". The world is saved and the
+        // activity finished already, so end the process without running destructors.
+        unsafe extern "C" {
+            fn _exit(status: i32) -> !;
+        }
+        unsafe { _exit(0) }
+    }
     std::process::exit(0);
 }

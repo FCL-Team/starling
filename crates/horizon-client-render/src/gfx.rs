@@ -15,6 +15,36 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+#[cfg(target_os = "android")]
+static ANDROID_IME_VIEWPORT_BOTTOM_INSET: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+#[cfg(target_os = "android")]
+static ANDROID_GRAPHICS_INFO: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The host launcher owns Android IME geometry. The engine only consumes the final
+/// bottom inset here so the completed frame can be translated upward without changing
+/// its render size or GUI scale.
+#[cfg(target_os = "android")]
+pub fn set_android_ime_viewport_bottom_inset(bottom_inset_px: u32) {
+    ANDROID_IME_VIEWPORT_BOTTOM_INSET
+        .store(bottom_inset_px, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(target_os = "android")]
+fn android_ime_viewport_bottom_inset() -> u32 {
+    ANDROID_IME_VIEWPORT_BOTTOM_INSET.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// GPU/driver/backend string for the host's in-game graphics information card.
+#[cfg(target_os = "android")]
+pub fn android_graphics_info() -> String {
+    ANDROID_GRAPHICS_INFO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_default()
+}
+
 // RenderPipelines.CRUMBLING: dst * src + src * dst, alpha replaced.
 const CRUMBLING_BLEND: wgpu::BlendState = wgpu::BlendState {
     color: wgpu::BlendComponent {
@@ -1573,6 +1603,18 @@ async fn open_backend(
     }
     describe_adapter(&adapter);
     let info = adapter.get_info();
+    #[cfg(target_os = "android")]
+    {
+        let driver = format!("{} {}", info.driver, info.driver_info);
+        let summary = if driver.trim().is_empty() {
+            format!("{} · {:?}", info.name, info.backend)
+        } else {
+            format!("{} · {:?} · {}", info.name, info.backend, driver.trim())
+        };
+        *ANDROID_GRAPHICS_INFO
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary);
+    }
     let limits = adapter.limits();
     if let Err(e) = check_layers(&adapter, layers) {
         return Err(NoDevice::Failed(format!("{name}: {e}")));
@@ -5999,11 +6041,14 @@ impl Renderer {
         }
         let size = [self.config.width, self.config.height];
         #[cfg(target_os = "android")]
+        let ime_viewport_bottom_inset = android_ime_viewport_bottom_inset();
+        #[cfg(target_os = "android")]
         let scaled_presentation = surface_frame.as_ref().is_some_and(|f| {
             let physical = [f.texture.width(), f.texture.height()];
             physical != size
                 || winit::platform::android::native_content_rect(physical)
                     != [0, 0, physical[0], physical[1]]
+                || ime_viewport_bottom_inset > 0
         });
         #[cfg(not(target_os = "android"))]
         let scaled_presentation = false;
@@ -6094,7 +6139,12 @@ impl Renderer {
             }
             #[cfg(target_os = "android")]
             if let (Some(scale), Some(frame)) = (&self.frame_scale, &surface_frame) {
-                scale.present(&mut encoder, &frame.texture);
+                scale.present(
+                    &self.queue,
+                    &mut encoder,
+                    &frame.texture,
+                    ime_viewport_bottom_inset,
+                );
             }
             #[cfg(target_os = "android")]
             if self.config.alpha_mode != wgpu::CompositeAlphaMode::Opaque
@@ -8739,7 +8789,12 @@ impl Renderer {
         }
         #[cfg(target_os = "android")]
         if let (Some(scale), Some(frame)) = (&self.frame_scale, &surface_frame) {
-            scale.present(&mut encoder, &frame.texture);
+            scale.present(
+                &self.queue,
+                &mut encoder,
+                &frame.texture,
+                android_ime_viewport_bottom_inset(),
+            );
         }
         #[cfg(target_os = "android")]
         if self.config.alpha_mode != wgpu::CompositeAlphaMode::Opaque

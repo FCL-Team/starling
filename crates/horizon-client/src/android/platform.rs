@@ -302,7 +302,9 @@ pub fn open_documents(id: &str) -> bool {
             .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?
             .l()?;
         let package: String = env.get_string((&package).into())?.into();
-        let authority = JObject::from(env.new_string(format!("{package}.documents"))?);
+        let authority = JObject::from(
+            env.new_string(crate::host_handoff::get().documents_authority(&package))?,
+        );
         let document = JObject::from(env.new_string(id)?);
         let uri = env
             .call_static_method(
@@ -469,13 +471,82 @@ pub fn active() -> bool {
 
 pub fn finish() {
     with_context(|env, activity| {
-        env.call_method(activity, "finish", "()V", &[])?;
+        let embedded = crate::host_handoff::get().embedded();
+        // The host activity's own quit removes its Recents card robustly and ends the
+        // dedicated process; older hosts only expose finishAndRemoveTask.
+        let method = if embedded { "quit" } else { "finish" };
+        if env.call_method(activity, method, "()V", &[]).is_err() && embedded {
+            env.call_method(activity, "finishAndRemoveTask", "()V", &[])?;
+        }
         Ok(())
     });
 }
 
+/// The game grabs or releases the pointer. With the host's controls, the grab is also
+/// reported to them and always succeeds: their touch camera needs no Android pointer
+/// capture.
 pub fn capture_mouse(capture: bool) -> bool {
+    let host_controls = crate::host_handoff::get().host_controls;
+    if host_controls {
+        crate::host_handoff::note_capture(capture);
+    }
+    request_pointer_capture(capture) || host_controls
+}
+
+fn request_pointer_capture(capture: bool) -> bool {
     crate::native_ime::capture_mouse(capture)
+        || with_context(|env, activity| {
+            let window = env
+                .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
+                .l()?;
+            let view = env
+                .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
+                .l()?;
+            env.call_method(
+                &view,
+                if capture {
+                    "requestPointerCapture"
+                } else {
+                    "releasePointerCapture"
+                },
+                "()V",
+                &[],
+            )?;
+            Ok(())
+        })
+        .is_some()
+}
+
+/// Asks the host launcher to open its own keyboard for the engine's focused text
+/// field (host-controls launches: the host owns the IME, Horizon never opens one).
+/// `initial` prefills the host's editor with the field's current value so edits
+/// to an existing value send correct diffs.
+pub fn request_host_keyboard(initial: &str) {
+    with_context(|env, activity| {
+        let text = env.new_string(initial)?;
+        env.call_method(
+            activity,
+            "showHostKeyboard",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&text)],
+        )?;
+        Ok(())
+    });
+}
+
+/// Tells the host launcher to close its keyboard (the engine's text field lost
+/// focus). In embedded mode Horizon never touches InputMethodManager itself.
+pub fn hide_host_keyboard() {
+    with_context(|env, activity| {
+        env.call_method(activity, "hideHostKeyboard", "()V", &[])?;
+        Ok(())
+    });
+}
+
+/// The chat screen's own entry, so its keyboard request can be routed like any other
+/// text field without reusing the generic editor state.
+pub fn show_chat(text: &str) {
+    show_editor(text, false);
 }
 
 pub fn show_secret(text: &str) {
@@ -492,6 +563,15 @@ pub fn show_multiline(text: &str) {
     show_editor(text, true);
 }
 fn show_editor(text: &str, multiline: bool) {
+    // Embedded FCL owns every Android IME request. Horizon must never open its native
+    // editor while host controls are active; FCL's Input/Keyboard action opens its own
+    // editor and forwards the resulting text/keys through host_input_jni instead. This
+    // also prevents a second T press from spawning Horizon's keyboard on top of FCL's
+    // controls.
+    if crate::host_handoff::get().host_controls {
+        EDIT.with(|e| *e.borrow_mut() = None);
+        return;
+    }
     MULTILINE.with(|mode| mode.set(multiline));
     if crate::native_ime::show(text) {
         EDIT.with(|e| *e.borrow_mut() = Some(text.into()));
@@ -501,10 +581,19 @@ fn show_editor(text: &str, multiline: bool) {
 }
 pub fn hide() {
     EDIT.with(|e| *e.borrow_mut() = None);
+    // In embedded mode Horizon must not touch InputMethodManager at all. Its hide call
+    // can otherwise dismiss FCL's editor IME because both live in the same Activity.
+    // FCL owns both showing and hiding the keyboard for this launch.
+    if crate::host_handoff::get().host_controls {
+        return;
+    }
     crate::native_ime::hide();
 }
 
 pub fn poll() -> Vec<Output> {
+    if crate::host_handoff::get().host_controls {
+        return vec![];
+    }
     EDIT.with(|edit| {
         let mut edit = edit.borrow_mut();
         let Some(old) = edit.as_mut() else {

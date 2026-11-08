@@ -74,6 +74,9 @@ large_enum_variant = "allow"
 # FIFO (VSync), where it was meant to pace frames; with VSync off it made every
 # frame wait for the GPU to finish the one before (#4604).
 # Drop this and the folder once a wgpu release has these fixes.
+# Horizon's own addition (not upstream): on Android, a host app embedding the engine can
+# hand over its Vulkan loader (bound to Turnip, PanVK, ...) as a dlopen handle in
+# WGPU_VULKAN_LOADER_HANDLE; see android_host_loader in src/vulkan/instance.rs.
 [patch.crates-io]
 winit = { path = "third_party/winit" }
 wgpu-hal = { path = "third_party/wgpu-hal" }

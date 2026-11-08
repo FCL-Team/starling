@@ -2244,6 +2244,9 @@ struct Game<'a> {
     focused: bool,
     /// Whether the window currently accepts input method events.
     ime_allowed: bool,
+    /// Host-controls launches: whether the launcher's keyboard was last asked
+    /// to show for a focused text field (Horizon never opens its own editor).
+    host_keyboard: bool,
     /// The candidate window's area last given to the window, in pixels.
     ime_area: Option<[i32; 4]>,
     /// When the window lost focus, while it is still without
@@ -7650,6 +7653,13 @@ impl Game<'_> {
     /// pauses the game. An open screen (books, signs, the pack prompt, a server
     /// dialog) stays instead of pausing (`Gui.setPauseScreen`).
     fn pause_if_inactive(&mut self) {
+        // The host launcher owns window focus for embedded Horizon: its controls
+        // overlay becomes focusable while the IME is open, which would trip the
+        // 500 ms lost-focus pause the moment a chat message returns to Playing.
+        // The player pauses explicitly with Esc instead.
+        if crate::host_handoff::get().host_controls {
+            return;
+        }
         if self
             .focus_lost
             .is_some_and(|t| t.elapsed() > Duration::from_millis(500))
@@ -7842,6 +7852,13 @@ impl Game<'_> {
         if effective == self.cursor_icon || !self.keyboard_mouse {
             return;
         }
+        // The host's dynamic mouse cursor, as SDL system cursor ids.
+        #[cfg(target_os = "android")]
+        crate::host_handoff::note_cursor(match effective {
+            Cursor::Arrow => 0,
+            Cursor::NotAllowed => 10,
+            Cursor::PointingHand => 11,
+        });
         if let Some(window) = &self.window {
             window.set_cursor(match effective {
                 Cursor::Arrow => winit::window::CursorIcon::Default,
@@ -17297,6 +17314,22 @@ impl Game<'_> {
                         self.right = false;
                         self.capture(false);
                     }
+                    #[cfg(target_os = "android")]
+                    if focused
+                        && crate::host_handoff::get().host_controls
+                        && self.player.is_some()
+                        && self.screen == Screen::Playing
+                        && self.title.is_none()
+                        && self.sign_edit.is_none()
+                        && self.book.is_none()
+                    {
+                        // FCL temporarily focuses its transparent IME panel while the
+                        // Android keyboard is visible. Chat can close during that
+                        // interval, but `capture(true)` correctly refuses to grab an
+                        // unfocused NativeActivity. Restore vanilla gameplay capture as
+                        // soon as the panel returns focus.
+                        self.capture(true);
+                    }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     if let Some(r) = &self.renderer {
@@ -18056,9 +18089,18 @@ impl Game<'_> {
                     let elapsed = now.duration_since(self.previous);
                     self.frame_ticks = elapsed.as_secs_f32() * 20.0;
                     self.previous = now;
+                    // Arrow-key camera controls belong to Horizon's standalone
+                    // keypad/keyboard path. FCL owns controller/camera translation in
+                    // embedded mode; an Arrow key produced during an IME focus handoff
+                    // must never become camera movement after chat closes.
+                    #[cfg(target_os = "android")]
+                    let host_owns_camera = crate::host_handoff::get().host_controls;
+                    #[cfg(not(target_os = "android"))]
+                    let host_owns_camera = false;
                     // Arrow-key camera controls belong to gameplay; chat and
                     // other screens use the same keys for their own navigation.
-                    if self.screen == Screen::Playing
+                    if !host_owns_camera
+                        && self.screen == Screen::Playing
                         && self.title.is_none()
                         && self.sign_edit.is_none()
                         && self.book.is_none()
@@ -18256,6 +18298,8 @@ impl Game<'_> {
                         horizon_client::crash::debug_crash_tick();
                         if self.fps_at.elapsed() >= Duration::from_secs(1) {
                             self.fps = self.fps_frames as f32 / self.fps_at.elapsed().as_secs_f32();
+                            #[cfg(target_os = "android")]
+                            crate::host_handoff::note_fps(self.fps);
                             self.fps_frames = 0;
                             self.fps_at = Instant::now();
                         }
@@ -18535,6 +18579,7 @@ impl<'a> Game<'a> {
             split_hud: Default::default(),
             focused: true,
             ime_allowed: false,
+            host_keyboard: false,
             ime_area: None,
             focus_lost: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
@@ -20337,7 +20382,15 @@ fn write_report(game: &Game<'_>) -> Result<()> {
 
 fn exit_app(events: &dyn event_loop::EventLoopCtl) {
     #[cfg(target_os = "android")]
-    horizon_client::android_runtime::return_to_launcher();
+    {
+        horizon_client::android_runtime::return_to_launcher();
+        // FCL embeds Horizon in its own Android process/task. End the event
+        // loop here so Launcher::exiting saves the world, then android_main
+        // reaches its embedded _exit(0) path and fully terminates :horizon.
+        if std::env::var_os("FCL_HORIZON_HOME").is_some() {
+            events.exit();
+        }
+    }
     #[cfg(not(target_os = "android"))]
     events.exit();
     #[cfg(target_os = "android")]
