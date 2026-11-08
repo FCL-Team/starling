@@ -77,8 +77,15 @@ pub extern "system" fn Java_com_mio_horizon_HorizonInput_cursor<'local>(
         });
     } else {
         // The presentation lifts the frame while the keyboard is open; the
-        // pointer rides the same shift to land on what the player sees.
-        let y = position.1 + f64::from(horizon_client::gfx::android_ime_lift());
+        // pointer rides the same shift to land on what the player sees. The
+        // inset gates it so a stale lift can never linger after the keyboard.
+        let inset = horizon_client::gfx::android_ime_viewport_bottom_inset();
+        let y = position.1
+            + if inset > 0 {
+                f64::from(horizon_client::gfx::android_ime_lift())
+            } else {
+                0.0
+            };
         host_input::push(HostInput::CursorMoved {
             x: position.0,
             y,

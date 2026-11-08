@@ -33,6 +33,11 @@ static ANDROID_GRAPHICS_INFO: std::sync::Mutex<Option<String>> = std::sync::Mute
 pub fn set_android_ime_viewport_bottom_inset(bottom_inset_px: u32) {
     ANDROID_IME_VIEWPORT_BOTTOM_INSET
         .store(bottom_inset_px, std::sync::atomic::Ordering::Release);
+    // The keyboard closed: the pointer's ride-along must end here too, because
+    // the scaled presentation may not run another frame to zero the lift itself.
+    if bottom_inset_px == 0 {
+        ANDROID_IME_LIFT.store(0, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// The focused text field's bottom edge in content pixels from the top, so the
@@ -61,7 +66,7 @@ pub(super) fn set_android_ime_lift(px: u32) {
 }
 
 #[cfg(target_os = "android")]
-fn android_ime_viewport_bottom_inset() -> u32 {
+pub fn android_ime_viewport_bottom_inset() -> u32 {
     ANDROID_IME_VIEWPORT_BOTTOM_INSET.load(std::sync::atomic::Ordering::Acquire)
 }
 
