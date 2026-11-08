@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import zipfile
 import json
 import hashlib
@@ -25,7 +26,15 @@ def latest(directory):
 
 def run(command, **kwargs):
     print(' '.join(map(str, command)), flush=True)
-    subprocess.run(list(map(str, command)), check=True, **kwargs)
+    command = list(map(str, command))
+    environment = kwargs.get('env')
+    if environment is not None and not os.path.dirname(command[0]):
+        # Windows looks a bare program name up on this process's PATH, not on the PATH
+        # passed to the child; resolve it on the child's PATH (which adds ~/.cargo/bin).
+        found = shutil.which(command[0], path=environment.get('PATH'))
+        if found:
+            command[0] = found
+    subprocess.run(command, check=True, **kwargs)
 
 
 def save_crash_symbols(library, stripped, abi, objcopy, revision):
@@ -110,6 +119,7 @@ def main():
     parser.add_argument('--gradle', type=Path, help='Gradle 8.14 executable (otherwise discover the cached distribution)')
     parser.add_argument('--check', action='store_true', help='Only type-check the Android target')
     parser.add_argument('--clippy', action='store_true', help='Run Android Clippy with warnings denied')
+    parser.add_argument('--host-libs', action='store_true', help='Build and stage only what a host app bundles (gradle-jni, gradle-assets), then stop: no standalone APK, so no Gradle 8.14')
     parser.add_argument('--bootstrap', type=Path, help=argparse.SUPPRESS)  # Old scripts: no longer used.
     args = parser.parse_args()
     if args.dev_build is not None:
@@ -146,6 +156,10 @@ def main():
     manifests = [(['-p', 'horizon-android'], features)]
     environment = dict(os.environ)
     environment['PATH'] = os.pathsep.join([str(ndk / 'bin'), str(args.java_home / 'bin'), environment['PATH']])
+    cargo_bin = Path.home() / '.cargo/bin'
+    if cargo_bin.is_dir():
+        # IDEs started before rustup was installed lack it on PATH.
+        environment['PATH'] = os.pathsep.join([environment['PATH'], str(cargo_bin)])
     environment['JAVA_HOME'] = str(args.java_home)
     target_dir = Path(environment.get('CARGO_TARGET_DIR', ROOT / 'target')).resolve()
     environment['CARGO_TARGET_DIR'] = str(target_dir)
@@ -194,12 +208,22 @@ def main():
         library = target_dir / target / ('debug' if args.profile == 'dev' else args.profile) / name
         if not library.is_file():
             raise FileNotFoundError(library)
+        # A host build runs on every app build: skip the copy and strip when
+        # cargo left the library as it was, so the host's packaging stays up to date.
+        source = library.stat()
+        stamp_file = staging / (name + '.source')
+        stamp = f'{args.profile}:{source.st_size}:{source.st_mtime_ns}'
+        if args.host_libs and (staging / name).is_file() and stamp_file.is_file() and stamp_file.read_text() == stamp:
+            print(f'Unchanged: {staging / name}', flush=True)
+            continue
+        stamp_file.unlink(missing_ok=True)
         shutil.copyfile(library, staging / name)
         run([ndk / 'bin' / ('llvm-strip' + suffix), '--strip-unneeded', staging / name])
         if args.profile == 'release':
             save_crash_symbols(library, staging / name, args.abi,
                                ndk / 'bin' / ('llvm-objcopy' + suffix),
                                environment.get('HORIZON_ANDROID_BUILD_COMMIT', 'unknown'))
+        stamp_file.write_text(stamp)
     assets = ROOT / '.local/android/gradle-assets'
     assets.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(ROOT / 'LICENSE', assets / 'LICENSE.txt')
@@ -207,12 +231,14 @@ def main():
     shutil.copyfile(engine_data(args.public), assets / 'engine-data.zip')
     controls = ROOT / '.local/android/bedrock-controls.zip'
     if not args.public and not controls.is_file():
-        import sys
         run([sys.executable, ROOT / 'tools/android_bedrock_controls.py'], cwd=ROOT)
     if args.public:
         (assets / 'bedrock-controls.zip').unlink(missing_ok=True)
     else:
         shutil.copyfile(controls, assets / 'bedrock-controls.zip')
+    if args.host_libs:
+        print(f'Engine for the host app: {staging / "libhorizon_android.so"} and {assets / "engine-data.zip"}', flush=True)
+        return
     key = ROOT / '.local/android/debug.keystore'
     if not key.exists():
         run([args.java_home / 'bin' / ('keytool' + suffix), '-genkeypair', '-keystore', key, '-storepass', 'android', '-keypass', 'android', '-alias', 'androiddebugkey', '-keyalg', 'RSA', '-validity', '3650', '-dname', 'CN=Horizon Android Development'])
