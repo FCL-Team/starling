@@ -20470,6 +20470,10 @@ struct Loading {
     shown: bool,
     menu: startup_menu::StartupMenu,
     error: Option<Box<dyn std::error::Error>>,
+    /// Host-launcher FPS feed (the game loop reports its own; the startup menu
+    /// runs on this loop until the world takes over).
+    fps_frames: u32,
+    fps_at: Instant,
 }
 impl Loading {
     /// Keep native events flowing while the GPU worker creates world resources.
@@ -20834,6 +20838,14 @@ impl Loading {
         self.draw_menu(&mut batch);
         horizon_client::widgets::publish_frame();
         self.menu.frame_drawn((batch.width, batch.height));
+        self.fps_frames += 1;
+        if self.fps_at.elapsed() >= Duration::from_secs(1) {
+            crate::host_handoff::note_fps(
+                self.fps_frames as f32 / self.fps_at.elapsed().as_secs_f32(),
+            );
+            self.fps_frames = 0;
+            self.fps_at = Instant::now();
+        }
         let mut frame = loading_frame(&batch);
         frame.yaw = self.panorama_rotation.update(
             self.started.elapsed().as_secs_f32(),
@@ -21197,6 +21209,8 @@ fn loading_app(
         shown: false,
         menu,
         error: None,
+        fps_frames: 0,
+        fps_at: Instant::now(),
     };
     Ok(App::Loading(Box::new(loading)))
 }
