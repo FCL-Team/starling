@@ -2471,6 +2471,10 @@ struct Game<'a> {
     focused: bool,
     /// Whether the window currently accepts input method events.
     ime_allowed: bool,
+    /// Host-controls launches: whether the launcher's keyboard was last asked to show for
+    /// a focused text field (the engine never opens its own editor then).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    host_keyboard: bool,
     /// The candidate window's area last given to the window, in pixels.
     ime_area: Option<[i32; 4]>,
     /// When the window lost focus, while it is still without
@@ -7895,6 +7899,13 @@ impl Game<'_> {
     /// pauses the game. An open screen (books, signs, the pack prompt, a server
     /// dialog) stays instead of pausing (`Gui.setPauseScreen`).
     fn pause_if_inactive(&mut self) {
+        // The host launcher owns window focus for embedded Horizon: its controls
+        // overlay becomes focusable while the IME is open, which would trip the
+        // 500 ms lost-focus pause the moment a chat message returns to Playing.
+        // The player pauses explicitly with Esc instead.
+        if crate::host_handoff::get().host_controls {
+            return;
+        }
         if self
             .focus_lost
             .is_some_and(|t| t.elapsed() > Duration::from_millis(500))
@@ -8001,6 +8012,8 @@ impl Game<'_> {
                 capture && self.input_mode == horizon_client::input_mode::InputMode::KeyboardMouse;
             if self.captured != was_grabbed {
                 crate::android::capture_pointer(self.captured);
+                // The host's controls map the pointer: they need the grab state too.
+                crate::host_handoff::note_capture(self.captured);
             }
         }
         #[cfg(not(target_os = "android"))]
@@ -8098,6 +8111,13 @@ impl Game<'_> {
         if effective == self.cursor_icon || !self.keyboard_mouse {
             return;
         }
+        // The host's dynamic mouse cursor, as SDL system cursor ids.
+        #[cfg(target_os = "android")]
+        crate::host_handoff::note_cursor(match effective {
+            Cursor::Arrow => 0,
+            Cursor::NotAllowed => 10,
+            Cursor::PointingHand => 11,
+        });
         if let Some(window) = &self.window {
             window.set_cursor(match effective {
                 Cursor::Arrow => winit::window::CursorIcon::Default,
@@ -17645,6 +17665,17 @@ impl Game<'_> {
                     self.focus_lost = (!focused).then(Instant::now);
                     if focused {
                         self.regrab_on_refocus();
+                        // A host launcher's controls overlay takes the focus while its
+                        // keyboard is open; the gameplay pointer comes back with it.
+                        if crate::host_handoff::get().host_controls
+                            && self.player.is_some()
+                            && self.screen == Screen::Playing
+                            && self.title.is_none()
+                            && self.sign_edit.is_none()
+                            && self.book.is_none()
+                        {
+                            self.capture(true);
+                        }
                     } else {
                         // A held pointer goes with the focus, wherever the
                         // system keeps the grab: the window asks for it back
@@ -18461,7 +18492,11 @@ impl Game<'_> {
                     self.previous = now;
                     // Arrow-key camera controls belong to gameplay; chat and
                     // other screens use the same keys for their own navigation.
-                    if self.screen == Screen::Playing
+                    // A host launcher owns the camera in an embedded launch: an Arrow key
+                    // produced during an IME focus handoff must never turn the view.
+                    let host_owns_camera = crate::host_handoff::get().host_controls;
+                    if !host_owns_camera
+                        && self.screen == Screen::Playing
                         && self.title.is_none()
                         && self.sign_edit.is_none()
                         && self.book.is_none()
@@ -18709,6 +18744,8 @@ impl Game<'_> {
                         horizon_client::crash::debug_crash_tick();
                         if self.fps_at.elapsed() >= Duration::from_secs(1) {
                             self.fps = self.fps_frames as f32 / self.fps_at.elapsed().as_secs_f32();
+                            #[cfg(target_os = "android")]
+                            crate::host_handoff::note_fps(self.fps);
                             self.fps_frames = 0;
                             self.fps_at = Instant::now();
                         }
@@ -19020,6 +19057,7 @@ impl<'a> Game<'a> {
             split_hud: Default::default(),
             focused: true,
             ime_allowed: false,
+            host_keyboard: false,
             ime_area: None,
             focus_lost: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
@@ -19061,7 +19099,13 @@ impl<'a> Game<'a> {
             touch: Default::default(),
             #[cfg(target_os = "android")]
             mobile: Default::default(),
-            input_mode: horizon_client::input_mode::InputMode::first(cfg!(target_os = "android")),
+            // A host launcher's controls arrive as a keyboard and mouse: the engine's
+            // touch UI and its own controller/keypad stay out of the way.
+            input_mode: if crate::host_handoff::get().host_controls {
+                horizon_client::input_mode::InputMode::KeyboardMouse
+            } else {
+                horizon_client::input_mode::InputMode::first(cfg!(target_os = "android"))
+            },
             frames: 0,
             glint_frame: Default::default(),
             kept_block_entities: Default::default(),
@@ -20968,6 +21012,27 @@ fn start_game<'a>(
         Some(settings) => settings,
         None => Settings::load(&Game::options_path()),
     };
+    // A host launcher's renderer choice for this launch only (never saved as Horizon's own
+    // setting, which stays what the player chose in the game).
+    if let Some(renderer) = crate::host_handoff::get().renderer {
+        settings.horizon.api = match renderer {
+            crate::host_handoff::HostRenderer::Vulkan => {
+                horizon_client::graphics::GraphicsApi::Vulkan
+            }
+            crate::host_handoff::HostRenderer::VulkanBatching => {
+                settings.horizon.translucent_batching = true;
+                horizon_client::graphics::GraphicsApi::Vulkan
+            }
+            crate::host_handoff::HostRenderer::OpenGl => {
+                horizon_client::graphics::GraphicsApi::OpenGl
+            }
+        };
+        crate::host_handoff::note_renderer(
+            renderer == crate::host_handoff::HostRenderer::OpenGl,
+            renderer == crate::host_handoff::HostRenderer::VulkanBatching,
+            false,
+        );
+    }
     if let Some(d) = options.distance_override {
         settings.render_distance = d;
     }
@@ -21200,6 +21265,10 @@ struct Loading {
     title_drawn: bool,
     menu: startup_menu::StartupMenu,
     error: Option<Box<dyn std::error::Error>>,
+    /// Host-launcher FPS feed (the game loop reports its own; the startup menu
+    /// runs on this loop until the world takes over).
+    fps_frames: u32,
+    fps_at: Instant,
     /// Why the resources did not load, kept on screen instead of quitting where no terminal
     /// shows the error (Android).
     failure: Option<String>,
@@ -21540,6 +21609,14 @@ impl Loading {
         }
         self.draw_menu_touch_editor(&mut batch, size);
         self.menu.frame_drawn((batch.width, batch.height));
+        self.fps_frames += 1;
+        if self.fps_at.elapsed() >= Duration::from_secs(1) {
+            crate::host_handoff::note_fps(
+                self.fps_frames as f32 / self.fps_at.elapsed().as_secs_f32(),
+            );
+            self.fps_frames = 0;
+            self.fps_at = Instant::now();
+        }
         let mut frame = loading_frame(&batch);
         frame.yaw = self.panorama_rotation.update(
             self.started.elapsed().as_secs_f32(),
@@ -21944,6 +22021,8 @@ fn run_loading(
         title_drawn: false,
         menu,
         error: None,
+        fps_frames: 0,
+        fps_at: Instant::now(),
         failure: None,
         setup: Default::default(),
         touch_pointer: Default::default(),

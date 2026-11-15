@@ -552,6 +552,12 @@ impl Game<'_> {
     /// own changes or put away; or NativeActivity's keyboard for a field it cannot read.
     #[cfg(target_os = "android")]
     pub(in crate::game) fn android_keyboard(&mut self, keyboard: bool) {
+        // The host launcher owns the IME in a host-controls launch: the engine's own
+        // editor and NativeActivity's keyboard stay out, and the focused field's text
+        // arrives as committed text through `host_input_jni`.
+        if crate::host_handoff::get().host_controls {
+            return;
+        }
         for event in crate::android::take_mirror_events() {
             match event {
                 crate::android::MirrorEvent::Edit {

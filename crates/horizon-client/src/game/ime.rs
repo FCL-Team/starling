@@ -7,6 +7,8 @@ use horizon_client::{
     hud::HudBatch,
     preedit::{self, PreeditEvent},
 };
+#[cfg(target_os = "android")]
+use winit::keyboard::KeyCode;
 
 impl Game<'_> {
     /// Whether a text box has focus right now (the fields `ime_commit` can fill).
@@ -43,8 +45,38 @@ impl Game<'_> {
         focused || cfg!(target_os = "android") && self.widget_text_focused()
     }
 
+    /// The focused text field's current value to pre-fill the host's keyboard with, so
+    /// editing an existing value sends correct diffs.
+    #[cfg(target_os = "android")]
+    fn host_keyboard_initial(&mut self) -> String {
+        if let Some(title) = self.title.as_mut() {
+            title.field_key(KeyCode::End, false, false);
+            if let Some((_, value, _)) = title.focused_field() {
+                return value.clone();
+            }
+        }
+        String::new()
+    }
+
     /// Allow the input method only while a text box has focus.
     pub(super) fn sync_ime(&mut self) {
+        // Host-controls launches: the launcher owns the IME and the engine never has its own
+        // editor, so its keyboard follows text-field focus changes here (mouse clicks and Tab
+        // navigation focus fields without a touch).
+        #[cfg(target_os = "android")]
+        if crate::host_handoff::get().host_controls {
+            let want = self.text_field_focused();
+            if want != self.host_keyboard {
+                self.host_keyboard = want;
+                if want {
+                    let initial = self.host_keyboard_initial();
+                    crate::android::request_host_keyboard(&initial);
+                } else {
+                    crate::android::hide_host_keyboard();
+                }
+            }
+            return;
+        }
         // On Android asking for the input method shows the keyboard: there a tap on the field
         // decides (touch.rs), not its focus.
         if cfg!(target_os = "android") {

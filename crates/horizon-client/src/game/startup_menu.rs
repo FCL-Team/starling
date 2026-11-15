@@ -39,6 +39,10 @@ pub(super) struct StartupMenu {
     narration: horizon_client::screen_narrator::ScreenNarrator,
     /// Frames drawn, for `widgets::end_frame`.
     frames: u64,
+    /// Host-controls launches: whether the launcher's keyboard was last asked to show for
+    /// a focused text field (the engine never opens its own editor then).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    host_keyboard: bool,
     /// The keyboard's focus (`key_focus`: Tab, the arrows, Enter); the
     /// pointer sits on it, as in the game.
     key_focus: Option<Target>,
@@ -180,6 +184,39 @@ impl StartupMenu {
         }
         self.narration
             .frame(gui, self.cursor, self.key_focus.map(|t| t.rect));
+        #[cfg(target_os = "android")]
+        self.sync_host_keyboard();
+    }
+
+    /// Host-controls launches: the launcher owns the IME, so its keyboard follows
+    /// text-field focus changes here (mouse clicks, Tab navigation and touch taps all
+    /// focus fields without the engine's own editor ever existing).
+    #[cfg(target_os = "android")]
+    fn sync_host_keyboard(&mut self) {
+        if !crate::host_handoff::get().host_controls {
+            return;
+        }
+        let focused = self
+            .title
+            .as_mut()
+            .is_some_and(|t| t.has_caret_field() || t.focused_field().is_some());
+        if focused == self.host_keyboard {
+            return;
+        }
+        self.host_keyboard = focused;
+        if focused {
+            let initial = self
+                .title
+                .as_mut()
+                .and_then(|t| {
+                    t.field_key(winit::keyboard::KeyCode::End, false, false);
+                    t.focused_field().map(|(_, value, _)| value.to_owned())
+                })
+                .unwrap_or_default();
+            crate::android::request_host_keyboard(&initial);
+        } else {
+            crate::android::hide_host_keyboard();
+        }
     }
 
     /// Which screen is open, as far as the keyboard's focus cares.
@@ -1222,6 +1259,16 @@ impl Loading {
             }
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::ModifiersChanged(modifiers) => self.menu.modifiers = modifiers.state(),
+            // Host/system input method commits type into the focused field: a host
+            // launcher's keyboard submits text as `Ime::Commit` in embedded mode.
+            WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
+                if let Some(title) = &mut self.menu.title {
+                    title.type_text(&text);
+                }
+            }
+            WindowEvent::Ime(winit::event::Ime::Disabled) => {
+                horizon_client::preedit::set_preedit(None)
+            }
             // `PackSelectionScreen.onFilesDrop`: a pack dropped on the window
             // joins the Create New World screen's data packs.
             WindowEvent::DroppedFile(path) => {

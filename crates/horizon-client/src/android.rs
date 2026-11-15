@@ -327,6 +327,30 @@ pub fn hide_keyboard() {
     });
 }
 
+/// Ask the host launcher to open its own keyboard for the engine's focused text field
+/// (`host_controls` launches: the host owns the IME). `initial` pre-fills the host's
+/// editor with the field's current value so edits to an existing value send correct diffs.
+pub fn request_host_keyboard(initial: &str) {
+    with_activity(|env, activity| {
+        let text = env.new_string(initial)?;
+        env.call_method(
+            activity,
+            "showHostKeyboard",
+            "(Ljava/lang/String;)V",
+            &[jni::objects::JValue::Object(&text)],
+        )
+        .map(drop)
+    });
+}
+
+/// Tell the host launcher to close its keyboard (the engine's text field lost focus).
+pub fn hide_host_keyboard() {
+    with_activity(|env, activity| {
+        env.call_method(activity, "hideHostKeyboard", "()V", &[])
+            .map(drop)
+    });
+}
+
 /// Start the game again in a new process (the game folder is chosen at start).
 pub fn restart_app() {
     with_activity(|env, activity| env.call_method(activity, "restart", "()V", &[]).map(drop));
@@ -713,6 +737,27 @@ mod input {
 
     /// The hook: the events taken are answered as handled; the others go on to winit.
     pub(super) fn hook(event: &InputEvent<'_>) -> Option<InputStatus> {
+        if crate::host_handoff::get().host_controls {
+            // A host launcher's own controller mapper reads the pads from its views. A pure
+            // D-pad is a keyboard to Android, so a mapped DPAD press must not leak through
+            // as an Arrow key and turn the camera.
+            match event {
+                InputEvent::KeyEvent(key) => {
+                    let source: u32 = key.source().into();
+                    let code = u32::from(key.key_code()) as i32;
+                    if source & 0x201 == 0x201 || pad::pad_key(source, code).is_some() {
+                        return Some(InputStatus::Unhandled);
+                    }
+                }
+                InputEvent::MotionEvent(motion) => {
+                    let source: u32 = motion.source().into();
+                    if pad::joystick(source) {
+                        return Some(InputStatus::Unhandled);
+                    }
+                }
+                _ => {}
+            }
+        }
         match event {
             InputEvent::KeyEvent(key) => key_input(key),
             InputEvent::MotionEvent(motion) => motion_input(motion),
@@ -961,8 +1006,9 @@ fn command_line(home: &Path) -> (Vec<String>, Vec<(String, String)>) {
     (args, env)
 }
 
-/// The game's console lines in logcat, under the tag `starling`.
-fn logcat(level: log::Level, message: &str) {
+/// The game's console lines in logcat, under the tag `starling`; also the logger of the
+/// host launcher's installer bridge (`host_install`).
+pub(crate) fn logcat(level: log::Level, message: &str) {
     use std::ffi::CString;
     let priority = match level {
         log::Level::Error => 6,
@@ -1235,8 +1281,27 @@ pub fn main(app: AndroidApp) {
         .unwrap_or_else(|| PathBuf::from("/data/local/tmp/horizon"));
     let _ = std::fs::create_dir_all(&private);
     let mut notes = Vec::new();
-    let home = game_folder(&private, &mut notes);
-    let (args, env) = command_line(&private);
+    // A host launcher that embeds the engine chooses its home; standalone, it is Android's.
+    let host = crate::host_handoff::get();
+    let home = match host.engine_home(None) {
+        Some(home) => home,
+        None => game_folder(&private, &mut notes),
+    };
+    let (mut args, env) = command_line(&private);
+    // The host's launch context, in the game's own command-line format.
+    if let Some(game_dir) = host.game_home() {
+        args.push("--game-dir".to_owned());
+        args.push(game_dir.display().to_string());
+    }
+    if let Some(session) = crate::host_handoff::take_session() {
+        args.push("--session-file".to_owned());
+        args.push(session.display().to_string());
+    }
+    if let Some(name) = host.offline_name() {
+        args.push("--name".to_owned());
+        args.push(name);
+    }
+    args.extend(host.quick_play_arguments());
     // SAFETY: no other thread of ours runs yet; the game reads these from its threads afterwards.
     unsafe {
         std::env::set_var("HORIZON_HOME", &home);
@@ -1302,6 +1367,14 @@ pub fn main(app: AndroidApp) {
         // The saved Microsoft sign-in renews while the game loads.
         crate::accounts::resume();
         winit::platform::android::set_input_hook(input::hook);
+        if host.host_controls {
+            // FCL is the only Android input owner for this launch. The engine's touch UI,
+            // keypad and system keyboard stay out of the way; FCL's mapped controls arrive
+            // through `host_input_jni` as ordinary keyboard/mouse events.
+            winit::platform::android::host_input::enable(true);
+        }
+        // Before any Vulkan instance exists: the host's chosen driver.
+        crate::host_handoff::prepare_vulkan_driver();
     });
     finish_and_exit()
 }
