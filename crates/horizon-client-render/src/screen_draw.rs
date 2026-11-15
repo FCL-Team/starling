@@ -954,6 +954,16 @@ impl TextField {
             // The chat and in-bed chat boxes and the pack screen's search are
             // `TextField`s; the other fields are an `EditBox` or a multiline
             // box, which report their own.
+            //
+            // The whole box, not just the caret: a host launcher moves its frame
+            // up by this box to keep it above the keyboard, and opens that
+            // keyboard only for a click inside it.
+            crate::preedit::report_field([
+                self.x as f32,
+                self.y as f32,
+                self.width as f32,
+                self.height as f32,
+            ]);
             crate::preedit::report_caret(cursor_x as f32, ty as f32, 10.0);
         }
     }

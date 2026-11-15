@@ -580,6 +580,9 @@ impl MultiLineEdit {
             batch.text(atlas, "_", cursor_x, cursor_y, cursor_color, true);
         }
         if self.focused {
+            // A host launcher moves its frame up by this box to keep it above the
+            // keyboard, and opens that keyboard only for a click inside it.
+            crate::preedit::report_field([self.x, self.y, self.width, self.height]);
             crate::preedit::report_caret(cursor_x, cursor_y, 10.0);
         }
         if self.has_selection() {
