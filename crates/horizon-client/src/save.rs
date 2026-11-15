@@ -133,13 +133,75 @@ pub fn dimension_dir(world: &Path, dimension: &str) -> PathBuf {
 }
 /// `DirectoryLock`: `session.lock` holds "\u{2603}" (UTF-16BE) under an exclusive
 /// file lock for as long as the world is open, so two instances cannot share it.
-pub struct SessionLock(fs::File);
+///
+/// On Android the host provides `FCL_HORIZON_LOCK_DIR`, an app-private directory for
+/// lock files. Worlds on emulated/shared storage (FUSE/sdcardfs semantics) coordinate
+/// through a hashed lock file there, because `flock` on their `session.lock` can report
+/// EAGAIN even when no other process owns the world; filesystems elsewhere fall back to
+/// it only when their `flock` fails outright.
+pub struct SessionLock {
+    file: fs::File,
+    /// The kernel lock actually guarding the world: either `session.lock` itself or,
+    /// when Android's shared storage rejects `flock`, an app-private file.
+    #[cfg(target_os = "android")]
+    fallback: Option<fs::File>,
+}
 impl Drop for SessionLock {
     /// `DirectoryLock.close`: release the lock, then close the file. Closing
     /// alone keeps the lock while any copy of the descriptor lives on, such as
     /// the one a process spawned on another thread holds until its `exec`.
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        #[cfg(target_os = "android")]
+        if let Some(fallback) = &self.fallback {
+            let _ = fallback.unlock();
+            return;
+        }
+        let _ = self.file.unlock();
+    }
+}
+/// Paths whose `flock` Android's shared storage may reject even when no one holds it.
+#[cfg(target_os = "android")]
+fn android_uses_private_session_lock(world: &Path) -> bool {
+    let path = world.to_string_lossy();
+    path.starts_with("/storage/emulated/")
+        || path.starts_with("/sdcard/")
+        || path.starts_with("/storage/self/primary/")
+}
+
+/// An app-private lock file for `world`, hashed so its path says which world it guards.
+#[cfg(target_os = "android")]
+fn android_private_lock(world: &Path) -> std::result::Result<fs::File, String> {
+    use std::hash::{Hash, Hasher};
+    let root = std::env::var_os("FCL_HORIZON_LOCK_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| "the host set no private lock directory".to_owned())?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    world.to_string_lossy().hash(&mut hasher);
+    let path = root.join(format!("{:016x}.lock", hasher.finish()));
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    match file.try_lock() {
+        Ok(()) => {
+            use std::io::Write;
+            if let Err(e) = file.set_len(0).and_then(|()| {
+                (&file).write_all(world.to_string_lossy().as_bytes())
+            }) {
+                return Err(e.to_string());
+            }
+            log::info!(
+                "using private Android world lock {} for {}",
+                path.display(),
+                world.display()
+            );
+            Ok(file)
+        }
+        Err(fs::TryLockError::WouldBlock) => Err("locked".to_owned()),
+        Err(fs::TryLockError::Error(e)) => Err(e.to_string()),
     }
 }
 impl SessionLock {
@@ -151,24 +213,66 @@ impl SessionLock {
             .create(true)
             .truncate(false)
             .open(world.join("session.lock"))?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err(
-                    format!("{} is already open in another instance", world.display()).into(),
-                );
+        #[cfg(target_os = "android")]
+        let mut fallback = None;
+        #[cfg(target_os = "android")]
+        let shared = android_uses_private_session_lock(world);
+        #[cfg(not(target_os = "android"))]
+        let shared = false;
+        if shared {
+            #[cfg(target_os = "android")]
+            match android_private_lock(world) {
+                Ok(private) => fallback = Some(private),
+                Err(error) if error == "locked" => {
+                    return Err(
+                        format!("{} is already open in another instance", world.display())
+                            .into(),
+                    );
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "cannot lock private Android world lock for {}: {error}",
+                        world.display()
+                    )
+                    .into());
+                }
             }
-            // A filesystem without file locks (Android's shared storage): the world opens
-            // unlocked, as vanilla's DirectoryLock does where locking is unsupported.
-            Err(fs::TryLockError::Error(e)) => log::warn!(
-                "Horizon: {} cannot be locked ({e}); opening it unlocked",
-                world.display()
-            ),
+        } else {
+            match file.try_lock() {
+                Ok(()) => {}
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(
+                        format!("{} is already open in another instance", world.display())
+                            .into(),
+                    );
+                }
+                // A filesystem without file locks: an app-private lock on Android,
+                // else the world opens unlocked, as vanilla's DirectoryLock does.
+                Err(fs::TryLockError::Error(e)) => {
+                    #[cfg(target_os = "android")]
+                    match android_private_lock(world) {
+                        Ok(private) => fallback = Some(private),
+                        Err(_) => log::warn!(
+                            "Horizon: {} cannot be locked ({e}); opening it unlocked",
+                            world.display()
+                        ),
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    log::warn!(
+                        "Horizon: {} cannot be locked ({e}); opening it unlocked",
+                        world.display()
+                    );
+                }
+            }
         }
         file.set_len(0)?;
         file.write_all(&[0x26, 0x03])?;
         file.flush()?;
-        Ok(Self(file))
+        Ok(Self {
+            file,
+            #[cfg(target_os = "android")]
+            fallback,
+        })
     }
     /// `DirectoryLock.isLocked`: another copy holds the world's `session.lock`.
     /// A world without the file is not locked; one whose file may not be opened
@@ -181,9 +285,31 @@ impl SessionLock {
             Ok(file) => file,
             Err(e) => return e.kind() == std::io::ErrorKind::PermissionDenied,
         };
+        #[cfg(target_os = "android")]
+        if android_uses_private_session_lock(world) {
+            return match android_private_lock(world) {
+                Ok(_) => {
+                    let _ = file.unlock();
+                    false
+                }
+                Err(error) => error == "locked",
+            };
+        }
         match file.try_lock() {
             Err(fs::TryLockError::WouldBlock) => true,
-            Err(_) => false,
+            Err(_) => {
+                // Locking is unsupported here: an app-private lock on Android may
+                // still say whether another instance owns the world.
+                #[cfg(target_os = "android")]
+                {
+                    return match android_private_lock(world) {
+                        Ok(_) => false,
+                        Err(error) => error == "locked",
+                    };
+                }
+                #[cfg(not(target_os = "android"))]
+                false
+            }
             // Take the probe's own lock back at once, as `SessionLock` does on drop.
             Ok(()) => {
                 let _ = file.unlock();
