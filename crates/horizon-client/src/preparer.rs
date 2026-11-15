@@ -100,10 +100,13 @@ pub fn start(resources: PathBuf) {
 }
 
 fn run(resources: &Path) -> Result<(), String> {
-    let runtime = starling_account::java::android_runtime(std::env::consts::ARCH)
-        .ok_or("No Java runtime is available for this architecture.")?;
-    let server_jar = crate::accounts::server_jar()
-        .ok_or("The game files are not all there: download them again.")?;
+    let server_jar = crate::accounts::server_jar().ok_or_else(|| {
+        if crate::host_env::get().files_home().is_some() {
+            "The host's game folder has no server.jar for its 26.3 version.".to_owned()
+        } else {
+            "The game files are not all there: download them again.".to_owned()
+        }
+    })?;
     let library = crate::platform::library_dir().ok_or("Starling cannot find its own files.")?;
     let home = home();
     let kit = home.join("kit");
@@ -111,19 +114,32 @@ fn run(resources: &Path) -> Result<(), String> {
     if !horizon_prepare::exporters::available(&kit) {
         return Err("The app's exporter bundle is missing, outdated or damaged. Install the current APK again.".into());
     }
-    let jre = home.join("jre25");
-    starling_account::java::install(
-        runtime,
-        &jre,
-        &|done, total| {
-            *shared() = if done >= total {
-                Stage::Unpacking
-            } else {
-                Stage::Java(done, total)
-            };
-        },
-        &|| false,
-    )?;
+    // A host that already installed a Java 25 runtime (its own `javac` included) lets the
+    // preparation run without fetching one; a standalone launch downloads it once.
+    let host_jre = crate::host_env::get().java_home().filter(|dir| {
+        dir.join("lib").join("libjli.so").is_file() && dir.join("bin").is_dir()
+    });
+    let jre = match host_jre {
+        Some(dir) => dir.clone(),
+        None => {
+            let runtime = starling_account::java::android_runtime(std::env::consts::ARCH)
+                .ok_or("No Java runtime is available for this architecture.")?;
+            let jre = home.join("jre25");
+            starling_account::java::install(
+                runtime,
+                &jre,
+                &|done, total| {
+                    *shared() = if done >= total {
+                        Stage::Unpacking
+                    } else {
+                        Stage::Java(done, total)
+                    };
+                },
+                &|| false,
+            )?;
+            jre
+        }
+    };
     let temp = home.join("tmp");
     std::fs::create_dir_all(&temp).map_err(|e| format!("{}: {e}", temp.display()))?;
     let env = |path: &Path| path.display().to_string();
@@ -186,10 +202,13 @@ fn run(resources: &Path) -> Result<(), String> {
         *shared() = Stage::Preparing(format!("Control textures: {done}/{total}"));
     })
     .map_err(|e| format!("Control textures: {e}"))?;
-    // Everything the game reads is in the resources now: the runtime and the work files go.
-    for done in [&jre, &kit.join(".local"), &temp] {
-        let _ = std::fs::remove_dir_all(done);
+    // Everything the game reads is in the resources now: the runtime this app fetched (never
+    // the host's own) and the work files go.
+    if jre == home.join("jre25") {
+        let _ = std::fs::remove_dir_all(&jre);
     }
+    let _ = std::fs::remove_dir_all(kit.join(".local"));
+    let _ = std::fs::remove_dir_all(&temp);
     Ok(())
 }
 

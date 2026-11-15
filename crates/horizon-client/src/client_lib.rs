@@ -85,6 +85,7 @@ pub mod gizmos;
 pub mod gossip;
 pub mod health;
 pub mod heartbeat;
+pub mod host_env;
 pub mod hotbar;
 pub mod hunger;
 pub mod import;

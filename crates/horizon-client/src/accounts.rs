@@ -29,14 +29,41 @@ pub fn dir() -> PathBuf {
     crate::logging::private_home().join("accounts")
 }
 
-/// Where the official files go, in the official launcher's layout (`versions/`, `libraries/`,
-/// `assets/`): the private folder, never shared storage.
-pub fn files_root() -> PathBuf {
-    crate::logging::private_home().join("minecraft")
+/// The host's own game folder when it launched from one (its `versions/`, `libraries/` and
+/// `assets/` are the official launcher's layout); `None` for a standalone launch.
+fn host_files_root() -> Option<PathBuf> {
+    crate::host_env::get()
+        .files_home()
+        .filter(|dir| {
+            dir.join("versions")
+                .join(horizon_core::VANILLA_VERSION)
+                .is_dir()
+        })
+        .cloned()
 }
 
-/// The server jar the last complete download fetched, for the preparer (preparer.rs).
+/// Where the official files are, in the official launcher's layout (`versions/`, `libraries/`,
+/// `assets/`): the host's own game folder when it gave one, else the private folder.
+pub fn files_root() -> PathBuf {
+    host_files_root().unwrap_or_else(|| crate::logging::private_home().join("minecraft"))
+}
+
+/// The server jar the last complete download fetched, for the preparer (preparer.rs). A host
+/// game folder supplies its own, beside the client's version or at the folder's root; the host
+/// fetches it there when it cannot.
 pub fn server_jar() -> Option<PathBuf> {
+    if let Some(root) = host_files_root() {
+        let version = horizon_core::VANILLA_VERSION;
+        for candidate in [
+            root.join("versions").join(version).join("server.jar"),
+            root.join("server.jar"),
+        ] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
     let done: serde_json::Value =
         serde_json::from_slice(&std::fs::read(files_root().join(FILES_DONE)).ok()?).ok()?;
     done["server"]
@@ -197,7 +224,9 @@ pub fn files() -> Files {
     let mut s = shared();
     if !s.files_seen {
         s.files_seen = true;
-        if s.files == Files::Missing && files_root().join(FILES_DONE).exists() {
+        // A host game folder the launcher already filled: no sign-in, no download.
+        let host_ready = host_files_root().is_some();
+        if s.files == Files::Missing && (host_ready || files_root().join(FILES_DONE).exists()) {
             s.files = Files::Ready;
         }
     }

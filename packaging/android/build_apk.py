@@ -357,6 +357,11 @@ def main():
             run(ndk_tool(ndk, "llvm-strip"), "--strip-unneeded", "-o", library, built)
         # prepare-kit.zip, lowbudget.zip and StarlingVisuals.zip: what platform::asset reads.
         assets(out)
+        # The Java launchers horizon-prepare runs on the phone (libstarling_java.so and
+        # libstarling_javac.so), which a host app bundles in its own jniLibs.
+        launchers = build_launchers(ndk, out, args.abi)
+        for name in ("libstarling_java.so", "libstarling_javac.so"):
+            print(f"Host Java launcher: {launchers[name]}")
         print(f"Engine for the host app: {library} and {out / 'assets'}")
         return
 
