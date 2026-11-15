@@ -2475,6 +2475,11 @@ struct Game<'a> {
     /// a focused text field (the engine never opens its own editor then).
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     host_keyboard: bool,
+    /// Host-controls launches: where the last click landed, in GUI pixels, until the next
+    /// frame tells whether a text field took the focus there (and only then shows the
+    /// launcher's keyboard).
+    #[cfg(target_os = "android")]
+    pending_host_click: Option<(f32, f32)>,
     /// The candidate window's area last given to the window, in pixels.
     ime_area: Option<[i32; 4]>,
     /// When the window lost focus, while it is still without
@@ -17295,6 +17300,15 @@ impl Game<'_> {
         if let Some((button, pressed, modifiers)) = mouse {
             self.native_mouse_button_post(button, pressed, modifiers);
         }
+        // A click on a text field shows the host's keyboard: the next frame knows which
+        // field took the focus and where it is, and only a click inside it opens the
+        // launcher's keyboard (a field focused by a screen itself stays quiet).
+        #[cfg(target_os = "android")]
+        if let Some((0, true, _)) = mouse
+            && crate::host_handoff::get().host_controls
+        {
+            self.pending_host_click = Some(self.cursor);
+        }
     }
     fn handle_window_event_inner(&mut self, event_loop: &dyn EventLoopCtl, mut event: WindowEvent) {
         if self.platform_keypad_event(event_loop, &mut event) {
@@ -19058,6 +19072,8 @@ impl<'a> Game<'a> {
             focused: true,
             ime_allowed: false,
             host_keyboard: false,
+            #[cfg(target_os = "android")]
+            pending_host_click: None,
             ime_area: None,
             focus_lost: None,
             modifiers: winit::keyboard::ModifiersState::empty(),

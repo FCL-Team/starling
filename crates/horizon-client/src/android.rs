@@ -749,11 +749,11 @@ mod input {
                         return Some(InputStatus::Unhandled);
                     }
                 }
-                InputEvent::MotionEvent(motion) => {
-                    let source: u32 = motion.source().into();
-                    if pad::joystick(source) {
-                        return Some(InputStatus::Unhandled);
-                    }
+                InputEvent::MotionEvent(_) => {
+                    // The host's own views take every touch, mouse and controller motion
+                    // event: the engine's touch UI, keypad, pointer and camera stay out of
+                    // the way, and Android hands the event to the host's overlay.
+                    return Some(InputStatus::Unhandled);
                 }
                 _ => {}
             }
@@ -1371,6 +1371,13 @@ pub fn main(app: AndroidApp) {
             // FCL is the only Android input owner for this launch. The engine's touch UI,
             // keypad and system keyboard stay out of the way; FCL's mapped controls arrive
             // through `host_input_jni` as ordinary keyboard/mouse events.
+            log::info!(
+                "Host embed: host controls on; files {}; java {}",
+                host.files_home()
+                    .map_or_else(|| "-".to_owned(), |dir| dir.display().to_string()),
+                host.java_home()
+                    .map_or_else(|| "-".to_owned(), |dir| dir.display().to_string()),
+            );
             winit::platform::android::host_input::enable(true);
         }
         // Before any Vulkan instance exists: the host's chosen driver.

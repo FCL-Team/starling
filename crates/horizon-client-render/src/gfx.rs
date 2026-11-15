@@ -37,6 +37,40 @@ pub(crate) fn android_ime_viewport_bottom_inset() -> u32 {
     ANDROID_IME_VIEWPORT_BOTTOM_INSET.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// The focused editor's bounds in window pixels, `[left, top, right, bottom]`, as the
+/// game reports them (`None`: no editor has the focus). The presentation pass moves
+/// the frame up just far enough to keep this box above the keyboard.
+#[cfg(target_os = "android")]
+static ANDROID_TEXT_FIELD: std::sync::Mutex<Option<[f32; 4]>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "android")]
+pub fn set_android_text_field(rect: Option<[f32; 4]>) {
+    *ANDROID_TEXT_FIELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = rect;
+}
+
+#[cfg(target_os = "android")]
+fn android_text_field() -> Option<[f32; 4]> {
+    *ANDROID_TEXT_FIELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// How far the presentation pass moved the frame up, in window pixels.
+#[cfg(target_os = "android")]
+static ANDROID_FRAME_SHIFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(target_os = "android")]
+pub fn set_android_frame_shift(pixels: u32) {
+    ANDROID_FRAME_SHIFT.store(pixels, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(target_os = "android")]
+pub fn android_frame_shift() -> u32 {
+    ANDROID_FRAME_SHIFT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// GPU/driver/backend string for the host's in-game graphics information card.
 #[cfg(target_os = "android")]
 pub fn android_graphics_info() -> String {
@@ -4640,6 +4674,9 @@ impl Renderer {
             Some(PresentMode::Immediate) => wgpu::PresentMode::Immediate,
             _ => wgpu::PresentMode::Fifo,
         };
+        log::info!(
+            "Horizon: present mode {mode:?} (vsync {vsync}, setting {setting:?}, supported {supported:?})"
+        );
         if self.config.present_mode != mode && self.surface.is_some() {
             self.config.present_mode = mode;
             self.configure_surface();

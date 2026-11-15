@@ -48,7 +48,7 @@ impl Game<'_> {
     /// The focused text field's current value to pre-fill the host's keyboard with, so
     /// editing an existing value sends correct diffs.
     #[cfg(target_os = "android")]
-    fn host_keyboard_initial(&mut self) -> String {
+    pub(super) fn host_keyboard_initial(&mut self) -> String {
         if let Some(title) = self.title.as_mut() {
             title.field_key(KeyCode::End, false, false);
             if let Some((_, value, _)) = title.focused_field() {
@@ -61,19 +61,14 @@ impl Game<'_> {
     /// Allow the input method only while a text box has focus.
     pub(super) fn sync_ime(&mut self) {
         // Host-controls launches: the launcher owns the IME and the engine never has its own
-        // editor, so its keyboard follows text-field focus changes here (mouse clicks and Tab
-        // navigation focus fields without a touch).
+        // editor. Focus alone never opens the keyboard there: a click inside the field does
+        // (`host_text_field`), so a screen that focuses a box by itself stays quiet.
         #[cfg(target_os = "android")]
         if crate::host_handoff::get().host_controls {
-            let want = self.text_field_focused();
-            if want != self.host_keyboard {
-                self.host_keyboard = want;
-                if want {
-                    let initial = self.host_keyboard_initial();
-                    crate::android::request_host_keyboard(&initial);
-                } else {
-                    crate::android::hide_host_keyboard();
-                }
+            if self.host_keyboard && !self.text_field_focused() {
+                self.host_keyboard = false;
+                log::info!("Host keyboard: hide (the field lost the focus)");
+                crate::android::hide_host_keyboard();
             }
             return;
         }
@@ -111,7 +106,12 @@ impl Game<'_> {
     /// input method's candidate window to the caret
     /// (`TextInputManager.setTextInputArea`, in window pixels).
     pub(super) fn flush_ime(&mut self, hud: &mut HudBatch) {
-        self.touch_text_field(preedit::take_focused_field());
+        let field = preedit::take_focused_field();
+        #[cfg(target_os = "android")]
+        if crate::host_handoff::get().host_controls {
+            self.host_text_field(hud, field);
+        }
+        self.touch_text_field(field);
         preedit::draw_overlay(hud, &self.gui.atlas);
         let Some([x0, y0, x1, y1]) = preedit::take_text_input_area() else {
             return;
@@ -134,6 +134,36 @@ impl Game<'_> {
             );
             self.ime_area = Some(area);
         }
+    }
+
+    /// Host-controls launches: publishes the focused field's bounds for the presentation
+    /// pass, which moves the frame up just far enough to keep the field above the
+    /// launcher's keyboard, and opens that keyboard only when the click that focused the
+    /// field landed inside it (a screen focusing a box by itself stays quiet).
+    #[cfg(target_os = "android")]
+    fn host_text_field(&mut self, hud: &HudBatch, field: Option<[f32; 4]>) {
+        let scale = hud.scale;
+        crate::gfx::set_android_text_field(
+            field.map(|[x, y, w, h]| [x * scale, y * scale, (x + w) * scale, (y + h) * scale]),
+        );
+        let Some((cx, cy)) = self.pending_host_click.take() else {
+            return;
+        };
+        let Some([x, y, w, h]) = field else {
+            return;
+        };
+        // 输入框边框外的少量容差,方便点边缘时也能弹出。
+        let pad = 8.0;
+        if cx < x - pad || cx > x + w + pad || cy < y - pad || cy > y + h + pad {
+            return;
+        }
+        let initial = self.host_keyboard_initial();
+        log::info!(
+            "Host keyboard: show on click ({} chars)",
+            initial.chars().count()
+        );
+        crate::android::request_host_keyboard(&initial);
+        self.host_keyboard = true;
     }
 
     /// Text the input method committed (`WindowEvent::Ime(Commit)`).

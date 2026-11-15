@@ -17,6 +17,11 @@ impl Game<'_> {
     /// on-screen keyboard goes (touch_frame); any input but a controller takes the menus back
     /// from the pad's pointer.
     pub(super) fn input_used(&mut self, input: InputMode) {
+        // A host launcher owns every input device: the mode stays keyboard and mouse, so
+        // the engine's touch controls and keypad never come up over the host's.
+        if crate::host_handoff::get().host_controls {
+            return;
+        }
         let mode = self
             .settings
             .touch

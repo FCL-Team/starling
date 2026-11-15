@@ -15,6 +15,14 @@ use winit::platform::android::host_input::{self, HostInput};
 /// The last pointer position the host reported, the baseline of each relative step.
 static HOST_CURSOR: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 
+/// The host's screen position, in the frame's own coordinates. The presentation pass
+/// moves the frame up while the host's keyboard covers the bottom, so a screen row
+/// shows the frame row that much lower.
+fn screen_to_frame(x: f32, y: f32) -> (f64, f64) {
+    let shift = f64::from(crate::gfx::android_frame_shift());
+    (f64::from(x), f64::from(y) + shift)
+}
+
 /// Records the new baseline and returns the previous one.
 fn baseline(position: &(f64, f64)) -> (f64, f64) {
     let mut guard = HOST_CURSOR.lock().unwrap_or_else(|error| error.into_inner());
@@ -35,6 +43,10 @@ pub extern "system" fn Java_com_mio_horizon_HorizonInput_key<'local>(
     let Some(code) = glfw_to_winit(glfw_key) else {
         return;
     };
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::info!("Host input: the first key reached the engine");
+    }
     host_input::push(HostInput::Key {
         code,
         pressed: pressed != 0,
@@ -68,7 +80,7 @@ pub extern "system" fn Java_com_mio_horizon_HorizonInput_cursor<'local>(
     x: jfloat,
     y: jfloat,
 ) {
-    let position = (f64::from(x), f64::from(y));
+    let position = screen_to_frame(x, y);
     let (last_x, last_y) = baseline(&position);
     if crate::host_handoff::grabbed() {
         host_input::push(HostInput::MouseMotion {
@@ -91,8 +103,9 @@ pub extern "system" fn Java_com_mio_horizon_HorizonInput_cursorSilently<'local>(
     x: jfloat,
     y: jfloat,
 ) {
-    baseline(&(f64::from(x), f64::from(y)));
-    host_input::set_cursor(f64::from(x), f64::from(y));
+    let position = screen_to_frame(x, y);
+    baseline(&position);
+    host_input::set_cursor(position.0, position.1);
 }
 
 /// A GLFW mouse button (0 left, 1 right, 2 middle), pressed or released.
@@ -131,8 +144,8 @@ pub extern "system" fn Java_com_mio_horizon_HorizonInput_isGrabbed<'local>(
     crate::host_handoff::grabbed() as jboolean
 }
 
-/// Lifts the finished frame by the IME height in the presentation pass, keeping the
-/// render size and GUI scale untouched.
+/// The keyboard's height: the presentation pass moves the frame up far enough to keep
+/// the focused text field above it, keeping the render size and GUI scale untouched.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_mio_horizon_HorizonInput_setImeViewportBottomInset<'local>(
     _env: JNIEnv<'local>,

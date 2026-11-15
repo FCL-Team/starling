@@ -5,8 +5,8 @@
 //!
 //! The same frame texture carries Android's host-launcher IME inset: while the
 //! host's keyboard covers the bottom of the surface, the finished frame is drawn
-//! onto the swapchain shifted up by it, so Minecraft's render size and GUI scale
-//! never change.
+//! moved up by just enough to keep the focused text field above it, so Minecraft's
+//! render size and GUI scale never change.
 
 /// The texture a frame to read back is drawn into, and the pass that puts it
 /// on the swapchain afterwards.
@@ -59,6 +59,8 @@ struct PostOut {
 }
 
 @fragment fn fs_present(in: PostOut) -> @location(0) vec4<f32> {
+    // The frame moves up: the presented row samples one row further down, and the
+    // band the keyboard covers at the bottom stays black.
     let uv = vec2<f32>(in.uv.x, in.uv.y + present.shift_y);
     if (uv.y > 1.0) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
@@ -176,6 +178,11 @@ impl Readback {
         screenshot: bool,
     ) -> Option<wgpu::Texture> {
         let shift = ime_inset() > 0;
+        #[cfg(target_os = "android")]
+        if !shift {
+            // 键盘收起:呈现帧不再平移,宿主坐标也不必换算。
+            super::set_android_frame_shift(0);
+        }
         if !shift && (!screenshot || surface.usage().contains(wgpu::TextureUsages::COPY_SRC)) {
             return None;
         }
@@ -235,8 +242,37 @@ impl Readback {
                 }
             };
             let height = surface.height().max(1);
-            let ratio = inset.min(height.saturating_sub(1)) as f32 / height as f32;
-            queue.write_buffer(&shifted.uniform, 0, bytemuck::cast_slice(&[ratio, 0.0, 0.0, 0.0]));
+            #[cfg(target_os = "android")]
+            let shift_px = {
+                let shift = super::android_text_field()
+                    .map(|field| {
+                        // 让焦点输入框整体落在键盘上沿之上,再留一点边距。
+                        let keyboard_top = height.saturating_sub(inset) as f32;
+                        let margin = height as f32 * 0.02;
+                        (field[3] + margin - keyboard_top).max(0.0)
+                    })
+                    .unwrap_or(0.0)
+                    .min(height.saturating_sub(1) as f32);
+                let shift_px = shift.round() as u32;
+                super::set_android_frame_shift(shift_px);
+                shift_px
+            };
+            #[cfg(not(target_os = "android"))]
+            let shift_px = 0u32;
+            let ratio = shift_px as f32 / height as f32;
+            static LAST: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(u64::MAX);
+            let key = (u64::from(inset) << 32) | u64::from(shift_px);
+            if LAST.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
+                log::info!(
+                    "Android frame presentation: keyboard {inset} px of {height}, frame moved up {shift_px} px"
+                );
+            }
+            queue.write_buffer(
+                &shifted.uniform,
+                0,
+                bytemuck::cast_slice(&[ratio, 0.0, 0.0, 0.0]),
+            );
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Android frame presentation"),
                 layout: &shifted.layout,
@@ -412,5 +448,116 @@ mod tests {
         let surface = texture(&device, wgpu::TextureUsages::RENDER_ATTACHMENT);
         assert!(readback.target(&device, &surface, false).is_none());
         assert!(readback.texture.is_none() && !readback.drawn);
+    }
+
+    /// The frame moves up above the keyboard: the rows it leaves at the bottom stay black.
+    #[test]
+    fn frame_moves_up_above_the_keyboard() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let format = wgpu::TextureFormat::Bgra8Unorm;
+        let size = wgpu::Extent3d {
+            width: 4,
+            height: 8,
+            depth_or_array_layers: 1,
+        };
+        let source = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut pixels = Vec::new();
+        for row in 0u8..8 {
+            let value = 40 + row * 24;
+            for _ in 0..4 {
+                pixels.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &source,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(16),
+                rows_per_image: Some(8),
+            },
+            size,
+        );
+        let frame = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let scaled = Shifted::new(&device, format);
+        // A keyboard covering half the surface: the frame keeps the top half.
+        queue.write_buffer(
+            &scaled.uniform,
+            0,
+            bytemuck::cast_slice(&[0.5f32, 0.0, 0.0, 0.0]),
+        );
+        let source_view = source.create_view(&Default::default());
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &scaled.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&scaled.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: scaled.uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let frame_view = frame.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &frame_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&scaled.pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        let buffer = crate::gfx::copy_frame(&device, &mut encoder, &frame, [4, 8]);
+        queue.submit([encoder.finish()]);
+        let presented = read(&device, &buffer);
+        let stride = (4usize * 4).next_multiple_of(256);
+        let red = |row: usize| presented[stride * row + 2];
+        assert!(red(0) > 0, "the frame's first row is on the surface");
+        for row in 4..8 {
+            assert_eq!(red(row), 0, "row {row} is under the keyboard");
+        }
     }
 }
