@@ -7,6 +7,13 @@ pub use horizon_client_lib::*;
 pub mod android;
 pub mod entry;
 pub mod game;
+pub mod host_handoff;
+#[cfg(target_os = "android")]
+pub mod host_addons_jni;
+#[cfg(target_os = "android")]
+pub mod host_input_jni;
+#[cfg(target_os = "android")]
+pub mod host_install;
 pub mod mod_api;
 
 pub mod diagnostics;
