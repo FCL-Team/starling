@@ -118,6 +118,11 @@ pub enum PresentMode {
 pub fn vsync_present_mode(supported: &[PresentMode], vsync: bool) -> Option<PresentMode> {
     let preferred: &[PresentMode] = if vsync {
         &[PresentMode::Fifo]
+    } else if cfg!(target_os = "android") {
+        // Mailbox can block for seconds in some Android GLES/Vulkan drivers (seen on
+        // Mali) and ANR the activity during loading: only an explicitly chosen Mailbox
+        // may be used, never one picked here.
+        &[PresentMode::Immediate, PresentMode::Fifo]
     } else {
         &[
             PresentMode::Immediate,
