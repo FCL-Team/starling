@@ -77,6 +77,9 @@ large_enum_variant = "allow"
 [patch.crates-io]
 wgpu-hal = { path = "third_party/wgpu-hal" }
 winit = { path = "third_party/winit" }
+# Horizon's own addition (not upstream): on Android, a host app embedding the engine can hand
+# over its Vulkan loader (bound to Turnip, PanVK, ...) as a dlopen handle in
+# WGPU_VULKAN_LOADER_HANDLE; see android_host_loader in third_party/wgpu-hal/src/vulkan/instance.rs.
 # naga 30.0.1, with the fixes to its GLSL frontend that shader packs need (THIRD_PARTY_NOTICES.md).
 naga = { path = "third_party/naga" }
 # libmimalloc-sys 0.1.49 whose mimalloc v3 counts bits without POPCNT when MSVC builds it: the
