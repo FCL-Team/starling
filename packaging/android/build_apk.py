@@ -322,6 +322,11 @@ def main():
         help=f"Starling Preview ({APPLICATION_ID}{VARIANTS['preview'][0]}), the organisation's CI build",
     )
     parser.add_argument("--abi", choices=TARGETS, default=ABI, help="Android ABI (default: arm64-v8a)")
+    parser.add_argument(
+        "--host-libs",
+        action="store_true",
+        help="build and stage only what a host app bundles (the library and its assets), then stop: no APK",
+    )
     args = parser.parse_args()
     triple, _, _ = TARGETS[args.abi]
 
@@ -339,6 +344,21 @@ def main():
     built = ROOT / "target" / triple / profile_dir / f"lib{LIBRARY}.so"
     if not built.is_file():
         sys.exit(f"build_apk: {built} not built")
+
+    if args.host_libs:
+        # A host app (Fold Craft Launcher) embeds the engine in its own APK: it bundles the
+        # library and the assets the engine reads, and makes its own manifest and Java side.
+        out = ROOT / "target" / "android" / "host"
+        out.mkdir(parents=True, exist_ok=True)
+        library = out / f"lib{LIBRARY}.so"
+        if args.keep_symbols:
+            shutil.copyfile(built, library)
+        else:
+            run(ndk_tool(ndk, "llvm-strip"), "--strip-unneeded", "-o", library, built)
+        # prepare-kit.zip, lowbudget.zip and StarlingVisuals.zip: what platform::asset reads.
+        assets(out)
+        print(f"Engine for the host app: {library} and {out / 'assets'}")
+        return
 
     out = ROOT / "target" / "android"
     out.mkdir(parents=True, exist_ok=True)
