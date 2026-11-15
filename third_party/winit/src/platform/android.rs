@@ -146,6 +146,19 @@ pub fn set_input_hook(hook: InputHook) {
     crate::platform_impl::set_input_hook(hook);
 }
 
+/// Input pushed by a host launcher's own Android views while it embeds the engine.
+///
+/// The queue is inert until [`host_input::enable`] is called; the standalone app never
+/// enables it. While enabled, gamepad and pure D-pad events stay unhandled so Android
+/// delivers them to the host activity's views, and the host pushes keyboard, mouse,
+/// scroll and committed text through [`host_input::push`] instead.
+pub mod host_input {
+    pub use crate::platform_impl::android::host_input::{
+        cursor, enable, enabled, gamepads_to_host, pointer_grabbed, push, set_cursor,
+        set_pointer_grabbed, set_waker, HostInput, DEVICE_ID,
+    };
+}
+
 impl<T> EventLoopBuilderExtAndroid for EventLoopBuilder<T> {
     fn with_android_app(&mut self, app: AndroidApp) -> &mut Self {
         self.platform_specific.android_app = Some(app);

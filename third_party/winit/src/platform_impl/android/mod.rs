@@ -26,6 +26,7 @@ use crate::window::{
 };
 
 mod keycodes;
+pub mod host_input;
 
 pub(crate) use crate::cursor::{
     NoCustomCursor as PlatformCustomCursor, NoCustomCursor as PlatformCustomCursorSource,
@@ -177,6 +178,7 @@ impl<T: 'static> EventLoop<T> {
              Android",
         );
         let redraw_flag = SharedFlag::new();
+        host_input::set_waker(android_app.create_waker());
 
         Ok(Self {
             android_app: android_app.clone(),
@@ -329,6 +331,11 @@ impl<T: 'static> EventLoop<T> {
             Err(err) => {
                 tracing::warn!("Failed to get input events iterator: {err:?}");
             },
+        }
+
+        // Input from the host app's own views, as a keyboard and mouse.
+        for input in host_input::drain() {
+            self.dispatch_host_input(input, callback);
         }
 
         // Empty the user event buffer
@@ -492,6 +499,127 @@ impl<T: 'static> EventLoop<T> {
         }
 
         input_status
+    }
+
+    /// Modifier keys held down by host-pushed input. The host's synthesized keys carry no
+    /// meta state, so the held Shift, Control, Alt and Super keys are counted here and sent
+    /// the same way. Horizon reads Shift and Control only from `ModifiersChanged`
+    /// (shift-click quick move, Control sprint, whole-stack drops), never from the keys
+    /// themselves.
+    fn host_modifiers(
+        code: crate::keyboard::KeyCode,
+        pressed: bool,
+        held: &mut Vec<crate::keyboard::KeyCode>,
+    ) -> crate::keyboard::ModifiersState {
+        use crate::keyboard::{KeyCode as K, ModifiersState as M};
+        let modifier = match code {
+            K::ShiftLeft | K::ShiftRight => Some(M::SHIFT),
+            K::ControlLeft | K::ControlRight => Some(M::CONTROL),
+            K::AltLeft | K::AltRight => Some(M::ALT),
+            K::SuperLeft | K::SuperRight => Some(M::SUPER),
+            _ => None,
+        };
+        if modifier.is_some() {
+            held.retain(|key| *key != code);
+            if pressed {
+                held.push(code);
+            }
+        }
+        held.iter()
+            .filter_map(|key| match *key {
+                K::ShiftLeft | K::ShiftRight => Some(M::SHIFT),
+                K::ControlLeft | K::ControlRight => Some(M::CONTROL),
+                K::AltLeft | K::AltRight => Some(M::ALT),
+                K::SuperLeft | K::SuperRight => Some(M::SUPER),
+                _ => None,
+            })
+            .fold(M::empty(), |all, one| all | one)
+    }
+
+    fn dispatch_host_input<F>(&mut self, input: host_input::HostInput, callback: &mut F)
+    where
+        F: FnMut(event::Event<T>, &RootAEL),
+    {
+        static HOST_MODIFIER_KEYS: Mutex<Vec<crate::keyboard::KeyCode>> = Mutex::new(Vec::new());
+        use host_input::HostInput as H;
+        let device_id = event::DeviceId(DeviceId(host_input::DEVICE_ID));
+        let window_id = window::WindowId(WindowId);
+        let event = match input {
+            H::MouseMotion { dx, dy } => {
+                callback(
+                    event::Event::DeviceEvent {
+                        device_id,
+                        event: event::DeviceEvent::MouseMotion { delta: (dx, dy) },
+                    },
+                    self.window_target(),
+                );
+                return;
+            },
+            H::CursorMoved { x, y } => event::WindowEvent::CursorMoved {
+                device_id,
+                // Host coordinates are already full-frame surface pixels: the host
+                // overlay and the engine window share the same surface, so no
+                // viewport translation applies here.
+                position: PhysicalPosition::new(x, y),
+            },
+            H::MouseButton { button, pressed } => event::WindowEvent::MouseInput {
+                device_id,
+                state: if pressed {
+                    event::ElementState::Pressed
+                } else {
+                    event::ElementState::Released
+                },
+                button: match button {
+                    0 => event::MouseButton::Left,
+                    1 => event::MouseButton::Right,
+                    2 => event::MouseButton::Middle,
+                    3 => event::MouseButton::Back,
+                    4 => event::MouseButton::Forward,
+                    other => event::MouseButton::Other(u16::from(other)),
+                },
+            },
+            H::Wheel { x, y } => event::WindowEvent::MouseWheel {
+                device_id,
+                delta: event::MouseScrollDelta::LineDelta(x, y),
+                phase: event::TouchPhase::Moved,
+            },
+            H::Text(text) => event::WindowEvent::Ime(event::Ime::Commit(text)),
+            H::Key { code, pressed, text } => {
+                let text = if pressed { text } else { None };
+                // Like Android's own key events: the modifiers first, then the key.
+                let mut held = HOST_MODIFIER_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+                let modifiers = Self::host_modifiers(code, pressed, &mut held);
+                drop(held);
+                callback(
+                    event::Event::WindowEvent {
+                        window_id,
+                        event: event::WindowEvent::ModifiersChanged(modifiers.into()),
+                    },
+                    self.window_target(),
+                );
+                event::WindowEvent::KeyboardInput {
+                    device_id,
+                    event: event::KeyEvent {
+                        state: if pressed {
+                            event::ElementState::Pressed
+                        } else {
+                            event::ElementState::Released
+                        },
+                        physical_key: crate::keyboard::PhysicalKey::Code(code),
+                        logical_key: host_input::logical_key(code, text.as_deref()),
+                        location: crate::keyboard::KeyLocation::Standard,
+                        repeat: false,
+                        text: text.map(smol_str::SmolStr::new),
+                        platform_specific: KeyEventExtra {},
+                    },
+                    is_synthetic: false,
+                }
+            },
+        };
+        callback(
+            event::Event::WindowEvent { window_id, event },
+            self.window_target(),
+        );
     }
 
     pub fn run<F>(mut self, event_handler: F) -> Result<(), EventLoopError>
