@@ -17,6 +17,36 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+#[cfg(target_os = "android")]
+static ANDROID_IME_VIEWPORT_BOTTOM_INSET: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+#[cfg(target_os = "android")]
+static ANDROID_GRAPHICS_INFO: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The host launcher owns Android IME geometry. The engine only consumes the final
+/// bottom inset here so the completed frame can be translated upward without changing
+/// its render size or GUI scale.
+#[cfg(target_os = "android")]
+pub fn set_android_ime_viewport_bottom_inset(bottom_inset_px: u32) {
+    ANDROID_IME_VIEWPORT_BOTTOM_INSET.store(bottom_inset_px, std::sync::atomic::Ordering::Release);
+}
+
+/// How far the host's keyboard covers the bottom of the surface, in window pixels.
+#[cfg(target_os = "android")]
+pub(crate) fn android_ime_viewport_bottom_inset() -> u32 {
+    ANDROID_IME_VIEWPORT_BOTTOM_INSET.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// GPU/driver/backend string for the host's in-game graphics information card.
+#[cfg(target_os = "android")]
+pub fn android_graphics_info() -> String {
+    ANDROID_GRAPHICS_INFO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_default()
+}
+
 // RenderPipelines.CRUMBLING: dst * src + src * dst, alpha replaced.
 const CRUMBLING_BLEND: wgpu::BlendState = wgpu::BlendState {
     color: wgpu::BlendComponent {
@@ -1930,6 +1960,18 @@ async fn open_backend(
     }
     describe_adapter(&adapter);
     let info = adapter.get_info();
+    #[cfg(target_os = "android")]
+    {
+        let driver = format!("{} {}", info.driver, info.driver_info);
+        let summary = if driver.trim().is_empty() {
+            format!("{} · {:?}", info.name, info.backend)
+        } else {
+            format!("{} · {:?} · {}", info.name, info.backend, driver.trim())
+        };
+        *ANDROID_GRAPHICS_INFO
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary);
+    }
     let limits = adapter.limits();
     if let Err(e) = check_layers(&adapter, layers) {
         return Err(NoDevice::Failed(format!("{name}: {e}")));
@@ -9389,7 +9431,7 @@ impl Renderer {
         }
         if let Some(f) = &surface_frame {
             self.readback
-                .present(&self.device, &mut encoder, &f.texture);
+                .present(&self.device, &self.queue, &mut encoder, &f.texture);
         }
         if let (Some(hdr), Some(f)) = (&self.hdr, &surface_frame) {
             hdr.present(

@@ -2,6 +2,11 @@
 //! offer `RENDER_ATTACHMENT` only, so a frame whose pixels are read back
 //! (the screenshot key, a world's icon) is drawn into a texture that can be,
 //! then drawn onto the swapchain image as a fullscreen triangle.
+//!
+//! The same frame texture carries Android's host-launcher IME inset: while the
+//! host's keyboard covers the bottom of the surface, the finished frame is drawn
+//! onto the swapchain shifted up by it, so Minecraft's render size and GUI scale
+//! never change.
 
 /// The texture a frame to read back is drawn into, and the pass that puts it
 /// on the swapchain afterwards.
@@ -9,21 +14,169 @@
 pub struct Readback {
     texture: Option<wgpu::Texture>,
     blitter: Option<(wgpu::TextureFormat, wgpu::util::TextureBlitter)>,
+    /// The pas that lifts the frame by the host's IME inset (built at its first use).
+    shift: Option<Shifted>,
     /// A frame drew into `texture` and still has to reach the swapchain.
     drawn: bool,
+}
+
+/// On Android, the host launcher's bottom inset in window pixels; 0 elsewhere.
+fn ime_inset() -> u32 {
+    #[cfg(target_os = "android")]
+    {
+        super::android_ime_viewport_bottom_inset()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        0
+    }
+}
+
+const SHIFT_SHADER: &str = r#"
+@group(0) @binding(0) var frame_tex: texture_2d<f32>;
+@group(0) @binding(1) var frame_sampler: sampler;
+
+struct PresentUniform {
+    // Fraction of the presented height to move the source upward.
+    shift_y: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+@group(0) @binding(2) var<uniform> present: PresentUniform;
+
+struct PostOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex fn vs_present(@builtin(vertex_index) i: u32) -> PostOut {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    var out: PostOut;
+    out.clip = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = vec2(p.x, 1.0 - p.y);
+    return out;
+}
+
+@fragment fn fs_present(in: PostOut) -> @location(0) vec4<f32> {
+    let uv = vec2<f32>(in.uv.x, in.uv.y + present.shift_y);
+    if (uv.y > 1.0) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    return textureSampleLevel(frame_tex, frame_sampler, uv, 0.0);
+}
+"#;
+
+/// The pipeline that copies the frame texture to the swapchain, moved up by the inset.
+struct Shifted {
+    format: wgpu::TextureFormat,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    pipeline: wgpu::RenderPipeline,
+    uniform: wgpu::Buffer,
+}
+
+impl Shifted {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Android frame presentation"),
+            source: wgpu::ShaderSource::Wgsl(SHIFT_SHADER.into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Android frame presentation bindings"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Android frame presentation"),
+            bind_group_layouts: &[Some(&layout)],
+            ..Default::default()
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Android frame presentation"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_present"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_present"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Android frame presentation"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Android frame presentation uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            format,
+            layout,
+            sampler,
+            pipeline,
+            uniform,
+        }
+    }
 }
 
 impl Readback {
     /// The texture this frame draws into instead of the swapchain image
     /// `surface`: `None` unless the frame is read back (`screenshot`) and the
-    /// image cannot be copied from.
+    /// image cannot be copied from, or the host's IME inset has to lift it.
     pub fn target(
         &mut self,
         device: &wgpu::Device,
         surface: &wgpu::Texture,
         screenshot: bool,
     ) -> Option<wgpu::Texture> {
-        if !screenshot || surface.usage().contains(wgpu::TextureUsages::COPY_SRC) {
+        let shift = ime_inset() > 0;
+        if !shift && (!screenshot || surface.usage().contains(wgpu::TextureUsages::COPY_SRC)) {
             return None;
         }
         let format = surface.format().remove_srgb_suffix();
@@ -54,6 +207,7 @@ impl Readback {
     pub fn present(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         surface: &wgpu::Texture,
     ) {
@@ -66,14 +220,63 @@ impl Readback {
         // The frame's passes write the swapchain through its non-sRGB view
         // (`view_formats`), so the copy goes there unconverted too.
         let format = surface.format().remove_srgb_suffix();
-        if self.blitter.as_ref().is_none_or(|b| b.0 != format) {
-            self.blitter = Some((format, wgpu::util::TextureBlitter::new(device, format)));
-        }
         let target = surface.create_view(&wgpu::TextureViewDescriptor {
             format: Some(format),
             ..Default::default()
         });
         let source = texture.create_view(&Default::default());
+        let inset = ime_inset();
+        if inset > 0 {
+            let shifted = match &self.shift {
+                Some(shift) if shift.format == format => shift,
+                _ => {
+                    let shift = Shifted::new(device, format);
+                    self.shift.insert(shift)
+                }
+            };
+            let height = surface.height().max(1);
+            let ratio = inset.min(height.saturating_sub(1)) as f32 / height as f32;
+            queue.write_buffer(&shifted.uniform, 0, bytemuck::cast_slice(&[ratio, 0.0, 0.0, 0.0]));
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Android frame presentation"),
+                layout: &shifted.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&source),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&shifted.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: shifted.uniform.as_entire_binding(),
+                    },
+                ],
+            });
+            let attachments = [Some(wgpu::RenderPassColorAttachment {
+                view: &target,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Android frame presentation"),
+                color_attachments: &attachments,
+                ..Default::default()
+            });
+            pass.set_pipeline(&shifted.pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+            return;
+        }
+        if self.blitter.as_ref().is_none_or(|b| b.0 != format) {
+            self.blitter = Some((format, wgpu::util::TextureBlitter::new(device, format)));
+        }
         if let Some((_, blitter)) = &self.blitter {
             blitter.copy(device, encoder, &source, &target);
         }
@@ -177,7 +380,7 @@ mod tests {
                 .unwrap_or_else(|| surface.clone());
             clear(&mut encoder, &frame, color);
             let buffer = crate::gfx::copy_frame(&device, &mut encoder, &frame, [70, 3]);
-            readback.present(&device, &mut encoder, &surface);
+            readback.present(&device, &queue, &mut encoder, &surface);
             queue.submit([encoder.finish()]);
             if let Some(error) = pollster::block_on(scope.pop()) {
                 panic!("{error}");
